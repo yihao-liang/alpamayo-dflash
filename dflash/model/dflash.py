@@ -153,7 +153,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.target_layer_ids = build_target_layer_ids(config.num_target_layers, config.num_hidden_layers)
+        # Use target_layer_ids from config if present, otherwise compute
+        if hasattr(config, 'target_layer_ids') and config.target_layer_ids is not None:
+            self.target_layer_ids = config.target_layer_ids
+        else:
+            self.target_layer_ids = build_target_layer_ids(config.num_target_layers, config.num_hidden_layers)
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)

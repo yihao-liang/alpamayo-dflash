@@ -1,13 +1,14 @@
 #!/bin/bash
 # Generate distillation data on 8 GPUs in parallel
-# Usage: ./run_distillation_data.sh [num_chunks] [output_dir] [target_layers]
+# Usage: ./run_distillation_data.sh [num_chunks] [output_dir] [target_layers] [stride]
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NUM_CHUNKS="${1:-400}"
+NUM_CHUNKS="${1:-256}"  # 10 chunks per GPU * 8 GPUs
 OUTPUT_DIR="${2:-/data/dflash_distillation}"
 TARGET_LAYERS="${3:-24,30,31,32,34}"
+STRIDE="${4:-1}"  # stride=1 to include boundary position
 NUM_GPUS=8
 CHUNKS_PER_GPU=$((NUM_CHUNKS / NUM_GPUS))
 
@@ -19,6 +20,7 @@ echo "GPUs: ${NUM_GPUS}"
 echo "Chunks per GPU: ${CHUNKS_PER_GPU}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Target layers: [${TARGET_LAYERS}]"
+echo "Stride: ${STRIDE}"
 echo "========================================"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -35,7 +37,7 @@ for rank in {0..7}; do
         --end-chunk ${END} \
         --output-dir "${OUTPUT_DIR}" \
         --target-layers "${TARGET_LAYERS}" \
-        --stride 4 \
+        --stride ${STRIDE} \
         2>&1 | tee "${OUTPUT_DIR}/rank${rank}.log" &
 done
 

@@ -215,7 +215,7 @@ def setup_tokenizer_for_dflash(
 class DFlashConfig:
     """Configuration for DFlash speculative decoding."""
 
-    block_size: int = 16
+    block_size: int = 8
     mask_token: str = "<|MASK|>"
     temperature: float = 0.0
     # Layer IDs to extract from target model (auto-computed if None)
@@ -243,6 +243,7 @@ class GenerationStats:
     acceptance_lengths: list[int] = field(default_factory=list)
     prefill_time_ms: float = 0.0
     decode_time_ms: float = 0.0
+    block_size: int = 8  # Must match accelerator's block_size
 
     @property
     def mean_acceptance_length(self) -> float:
@@ -257,7 +258,7 @@ class GenerationStats:
         if not self.acceptance_lengths:
             return 0.0
         # Each iteration drafts block_size-1 tokens, accepts acceptance_length-1 + 1 from target
-        total_drafted = len(self.acceptance_lengths) * 15  # block_size - 1
+        total_drafted = len(self.acceptance_lengths) * (self.block_size - 1)
         total_accepted = sum(max(0, a - 1) for a in self.acceptance_lengths)
         return total_accepted / total_drafted if total_drafted > 0 else 0.0
 
@@ -353,9 +354,15 @@ class DFlashAlpamayoAccelerator:
         # Option 1: Use override if specified (preferred for pretrained DFlash)
         if self.config.mask_token_id_override is not None:
             mask_id = self.config.mask_token_id_override
-            # Verify the token exists in vocabulary
             vocab_size = self.target_vlm.get_input_embeddings().weight.shape[0]
-            if mask_id >= vocab_size:
+            # If mask_id is at vocab boundary, resize embeddings (training added this token)
+            if mask_id == vocab_size:
+                logger.info(f"[DFlash] Resizing embeddings from {vocab_size} to {vocab_size + 1} for mask token")
+                self.target_vlm.resize_token_embeddings(vocab_size + 1)
+                # Initialize new embedding to mean for stability
+                if self.config.init_mask_to_mean:
+                    self._init_mask_embedding_to_mean(mask_id)
+            elif mask_id > vocab_size:
                 raise ValueError(
                     f"mask_token_id_override={mask_id} is out of vocabulary range ({vocab_size}). "
                     "Ensure the ID matches the token used during DFlash training."
@@ -404,14 +411,15 @@ class DFlashAlpamayoAccelerator:
 
         return self.tokenizer.mask_token_id
 
-    def _init_mask_embedding_to_mean(self) -> None:
+    def _init_mask_embedding_to_mean(self, mask_id: int | None = None) -> None:
         """Initialize the mask token embedding to the mean of all existing embeddings.
 
         This provides more stable behavior than random initialization when the exact
         mask token from DFlash training is unknown.
         """
         input_embeddings = self.target_vlm.get_input_embeddings()
-        mask_id = self.tokenizer.mask_token_id
+        if mask_id is None:
+            mask_id = self.tokenizer.mask_token_id
 
         with torch.no_grad():
             # Compute mean of all embeddings (excluding the new mask token)
@@ -464,7 +472,8 @@ class DFlashAlpamayoAccelerator:
         device = input_ids.device
         bsz = input_ids.shape[0]
         temperature = temperature if temperature is not None else self.config.temperature
-        stats = GenerationStats()
+        block_size = self.block_size
+        stats = GenerationStats(block_size=block_size)
 
         # Speculative decoding with token-level acceptance requires batch_size=1
         # (different sequences would have different acceptance lengths)
@@ -476,7 +485,6 @@ class DFlashAlpamayoAccelerator:
 
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
-        block_size = self.block_size
 
         # Initialize output buffer with mask tokens
         output_ids = torch.full(

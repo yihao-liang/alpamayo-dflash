@@ -237,10 +237,17 @@ def main():
     # Extract trajectory token config from the Alpamayo model
     traj_offset = getattr(model.config, "traj_token_start_idx", None)
     traj_vocab = getattr(model.config, "traj_vocab_size", None)
+    # Get mask_token_id from draft model config (critical for correct inference)
+    mask_token_id = getattr(draft_model, "mask_token_id", None)
+    if mask_token_id is None:
+        mask_token_id = getattr(draft_model.config, "mask_token_id", None)
+    if mask_token_id is not None:
+        logger.info(f"Using mask_token_id={mask_token_id} from draft model")
     config = DFlashConfig(
         temperature=args.temperature,
         traj_token_offset=traj_offset,
         traj_vocab_size=traj_vocab,
+        mask_token_id_override=mask_token_id,
     )
     accelerator = DFlashAlpamayoAccelerator(
         draft_model=draft_model,

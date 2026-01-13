@@ -207,6 +207,15 @@ def create_training_blocks(
 
     positions = list(range(start_pos, end_pos, stride))
 
+    # When stride > 1, ensure the prompt/generation boundary position is included.
+    # This is where inference starts: hidden state at last prompt token,
+    # predicting first block_size tokens of generation.
+    if stride > 1:
+        boundary_pos = generation_start_idx - 1
+        if boundary_pos >= 0 and boundary_pos not in positions and boundary_pos < end_pos:
+            positions.append(boundary_pos)
+            positions.sort()
+
     block_hidden = []
     block_tokens = []
     block_labels = []
