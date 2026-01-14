@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Generate offline distillation data for DFlash training.
 
-Extracts (hidden_state, future_tokens) pairs from Alpamayo VLM and saves to disk.
-This allows fast training without loading Alpamayo during training.
+Extracts (hidden_state, future_tokens, top_k_logits) from Alpamayo VLM and saves to disk.
+This allows fast training with KL loss without loading Alpamayo during training.
 
 Usage:
     python generate_distillation_data.py \
         --cache-dir /data/physicalai_av/hf_cache \
         --output-dir /data/dflash_distillation \
         --num-chunks 400 \
-        --stride 4
+        --stride 4 \
+        --top-k-logits 128
 """
 
 import argparse
@@ -59,8 +60,8 @@ def extract_hidden_states_and_tokens(
     data: dict,
     target_layer_ids: list[int],
     device: str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run Alpamayo forward pass and extract hidden states + generated tokens.
+) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]:
+    """Run Alpamayo forward pass and extract hidden states + generated tokens + logits.
 
     Args:
         model: Alpamayo model
@@ -73,6 +74,7 @@ def extract_hidden_states_and_tokens(
         hidden_states: (seq_len, num_layers * hidden_dim) - concatenated hidden states
         input_ids: (seq_len,) - full sequence (input + generated)
         generation_start_idx: int - where generation starts
+        logits: (seq_len, vocab_size) - target model logits for KL loss
     """
     messages = helper.create_message(data["image_frames"].flatten(0, 1))
 
@@ -151,22 +153,27 @@ def extract_hidden_states_and_tokens(
     # (batch, seq, num_layers * hidden)
     target_hidden = torch.cat(target_hidden_list, dim=-1)
 
-    return target_hidden[0], full_input_ids[0], input_len
+    # Get logits for KL loss
+    logits = outputs.logits[0]  # (seq_len, vocab_size)
+
+    return target_hidden[0], full_input_ids[0], input_len, logits
 
 
-def mask_extended_vocab_tokens(tokens: torch.Tensor) -> torch.Tensor:
-    """Mask tokens outside standard Qwen3 vocabulary with IGNORE_INDEX.
+def mask_extended_vocab_tokens(tokens: torch.Tensor, mask_extended: bool = True) -> torch.Tensor:
+    """Optionally mask tokens outside standard Qwen3 vocabulary with IGNORE_INDEX.
 
     Alpamayo extends the vocabulary with trajectory tokens (>= 151936).
-    These should be masked during distillation training since DFlash
-    only needs to learn CoC text generation, not trajectory tokens.
 
     Args:
         tokens: Token IDs tensor
+        mask_extended: If True, mask extended vocab tokens. If False, keep all tokens.
 
     Returns:
-        Labels tensor with extended tokens replaced by IGNORE_INDEX (-100)
+        Labels tensor (with extended tokens replaced by IGNORE_INDEX if mask_extended=True)
     """
+    if not mask_extended:
+        return tokens.clone()
+
     labels = tokens.clone()
     mask = labels >= STANDARD_VOCAB_SIZE
     if mask.any():
@@ -177,23 +184,31 @@ def mask_extended_vocab_tokens(tokens: torch.Tensor) -> torch.Tensor:
 def create_training_blocks(
     hidden_states: torch.Tensor,
     input_ids: torch.Tensor,
+    logits: torch.Tensor,
     generation_start_idx: int,
     block_size: int = BLOCK_SIZE,
     stride: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Create (hidden_state, future_tokens, labels) tuples with sliding window.
+    top_k_logits: int = 128,
+    mask_extended_vocab: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create (hidden_state, future_tokens, labels, top_k_logits) tuples with sliding window.
 
     Args:
         hidden_states: (seq_len, hidden_dim)
         input_ids: (seq_len,)
+        logits: (seq_len, vocab_size) - target model logits
         generation_start_idx: where generation starts (we want blocks that predict generated tokens)
         block_size: number of future tokens per block
         stride: step size for sliding window
+        top_k_logits: number of top logits to store per position
+        mask_extended_vocab: If True, mask trajectory tokens. If False, train on full vocab.
 
     Returns:
         block_hidden: (num_blocks, hidden_dim) - target model hidden states
         block_tokens: (num_blocks, block_size) - actual token IDs (for noise embedding)
-        block_labels: (num_blocks, block_size) - masked labels (for loss computation)
+        block_labels: (num_blocks, block_size) - labels (optionally masked)
+        block_topk_values: (num_blocks, block_size-1, top_k) - top-k logit values
+        block_topk_indices: (num_blocks, block_size-1, top_k) - top-k logit indices
     """
     seq_len = hidden_states.shape[0]
 
@@ -203,7 +218,7 @@ def create_training_blocks(
     end_pos = seq_len - block_size
 
     if end_pos <= start_pos:
-        return None, None, None
+        return None, None, None, None, None
 
     positions = list(range(start_pos, end_pos, stride))
 
@@ -219,19 +234,31 @@ def create_training_blocks(
     block_hidden = []
     block_tokens = []
     block_labels = []
+    block_topk_values = []
+    block_topk_indices = []
 
     for pos in positions:
         block_hidden.append(hidden_states[pos])
         tokens = input_ids[pos + 1 : pos + 1 + block_size]
         block_tokens.append(tokens)
-        # Mask extended vocab tokens (trajectory tokens, special tokens > 151936)
-        block_labels.append(mask_extended_vocab_tokens(tokens))
+        # Optionally mask extended vocab tokens (trajectory tokens > 151936)
+        block_labels.append(mask_extended_vocab_tokens(tokens, mask_extended=mask_extended_vocab))
+
+        # Extract top-k logits for positions 1 to block_size (predicting tokens 2 to block_size)
+        # logits[pos] predicts token at pos+1, so logits[pos:pos+block_size-1] predict tokens pos+1 to pos+block_size-1
+        # We need logits for predicting tokens at positions pos+2 to pos+block_size (block_size-1 positions)
+        block_logits = logits[pos + 1 : pos + block_size]  # (block_size-1, vocab_size)
+        topk_vals, topk_inds = block_logits.topk(top_k_logits, dim=-1)
+        block_topk_values.append(topk_vals)
+        block_topk_indices.append(topk_inds)
 
     block_hidden = torch.stack(block_hidden)
     block_tokens = torch.stack(block_tokens)
     block_labels = torch.stack(block_labels)
+    block_topk_values = torch.stack(block_topk_values)  # (num_blocks, block_size-1, top_k)
+    block_topk_indices = torch.stack(block_topk_indices)  # (num_blocks, block_size-1, top_k)
 
-    return block_hidden, block_tokens, block_labels
+    return block_hidden, block_tokens, block_labels, block_topk_values, block_topk_indices
 
 
 def main():
@@ -296,6 +323,17 @@ def main():
         default=None,
         help="Comma-separated target layer indices (e.g., '24,30,31,32,34'). Default: [24,30,31,32,34]",
     )
+    parser.add_argument(
+        "--top-k-logits",
+        type=int,
+        default=128,
+        help="Number of top logits to store per position for KL loss (default: 128)",
+    )
+    parser.add_argument(
+        "--full-vocab",
+        action="store_true",
+        help="Train on full vocabulary including trajectory tokens (don't mask extended vocab)",
+    )
     args = parser.parse_args()
 
     # Parse target layers
@@ -312,8 +350,10 @@ def main():
 
     # Determine device
     if args.rank is not None:
-        device = f"cuda:{args.rank}"
-        torch.cuda.set_device(args.rank)
+        # When CUDA_VISIBLE_DEVICES is set, only 1 GPU is visible as device 0
+        # rank is only used for file naming, not device selection
+        device = "cuda:0"
+        torch.cuda.set_device(0)
         rank_suffix = f"_rank{args.rank}"
     else:
         device = "cuda"
@@ -346,11 +386,15 @@ def main():
     logger.info(f"[Rank {args.rank}] Processing {len(clip_ids)} clips from chunks {list(chunk_range)}")
     logger.info(f"[Rank {args.rank}] Block size: {BLOCK_SIZE}, Stride: {args.stride}")
     logger.info(f"[Rank {args.rank}] Target layers: {target_layer_ids}")
+    logger.info(f"[Rank {args.rank}] Top-K logits: {args.top_k_logits}")
+    logger.info(f"[Rank {args.rank}] Full vocab (no masking): {args.full_vocab}")
 
     # Process clips and accumulate blocks
     all_hidden = []
     all_tokens = []
     all_labels = []
+    all_topk_values = []
+    all_topk_indices = []
     total_blocks = 0
     masked_tokens_count = 0
     shard_idx = 0
@@ -367,24 +411,29 @@ def main():
                 maybe_stream=False,
             )
 
-            # Extract hidden states and tokens
-            hidden_states, input_ids, gen_start = extract_hidden_states_and_tokens(
+            # Extract hidden states, tokens, and logits
+            hidden_states, input_ids, gen_start, logits = extract_hidden_states_and_tokens(
                 model, processor, data, target_layer_ids, device=device
             )
 
-            # Create training blocks
-            block_hidden, block_tokens, block_labels = create_training_blocks(
+            # Create training blocks with top-k logits
+            block_hidden, block_tokens, block_labels, block_topk_vals, block_topk_inds = create_training_blocks(
                 hidden_states.cpu(),
                 input_ids.cpu(),
+                logits.cpu(),
                 gen_start,
                 block_size=BLOCK_SIZE,
                 stride=args.stride,
+                top_k_logits=args.top_k_logits,
+                mask_extended_vocab=not args.full_vocab,
             )
 
             if block_hidden is not None:
                 all_hidden.append(block_hidden.half())  # Convert to fp16
                 all_tokens.append(block_tokens.int())
                 all_labels.append(block_labels.int())
+                all_topk_values.append(block_topk_vals.half())  # fp16
+                all_topk_indices.append(block_topk_inds.int())  # int32
                 total_blocks += block_hidden.shape[0]
                 # Count masked tokens (extended vocab)
                 masked_tokens_count += (block_labels == IGNORE_INDEX).sum().item()
@@ -393,10 +442,12 @@ def main():
 
             # Save shard when enough blocks accumulated
             if total_blocks >= args.shard_size * (shard_idx + 1):
-                save_shard(all_hidden, all_tokens, all_labels, output_dir, shard_idx, args, rank_suffix)
+                save_shard(all_hidden, all_tokens, all_labels, all_topk_values, all_topk_indices, output_dir, shard_idx, args, rank_suffix)
                 all_hidden = []
                 all_labels = []
                 all_tokens = []
+                all_topk_values = []
+                all_topk_indices = []
                 shard_idx += 1
 
         except Exception as e:
@@ -405,7 +456,7 @@ def main():
 
     # Save remaining blocks
     if all_hidden:
-        save_shard(all_hidden, all_tokens, all_labels, output_dir, shard_idx, args, rank_suffix)
+        save_shard(all_hidden, all_tokens, all_labels, all_topk_values, all_topk_indices, output_dir, shard_idx, args, rank_suffix)
         shard_idx += 1
 
     # Save metadata
@@ -420,6 +471,8 @@ def main():
         "target_layer_ids": target_layer_ids,
         "num_target_layers": NUM_TARGET_LAYERS,
         "num_draft_layers": NUM_DRAFT_LAYERS,
+        "top_k_logits": args.top_k_logits,
+        "full_vocab": args.full_vocab,
         "num_clips": len(clip_ids),
         "failed_clips": len(failed_clips),
         "standard_vocab_size": STANDARD_VOCAB_SIZE,
@@ -447,23 +500,29 @@ def main():
     logger.info(f"  Output: {output_dir}")
 
 
-def save_shard(all_hidden, all_tokens, all_labels, output_dir, shard_idx, args, rank_suffix=""):
+def save_shard(all_hidden, all_tokens, all_labels, all_topk_values, all_topk_indices, output_dir, shard_idx, args, rank_suffix=""):
     """Save accumulated blocks to a shard file.
 
     Each shard contains:
         - target_hidden: Hidden states from Alpamayo (for conditioning drafter)
         - future_tokens: Actual token IDs (for creating noise embeddings)
         - labels: Masked labels for loss computation (extended vocab tokens → -100)
+        - topk_values: Top-k logit values for KL loss (fp16)
+        - topk_indices: Top-k logit indices for KL loss (int32)
     """
     hidden = torch.cat(all_hidden, dim=0)
     tokens = torch.cat(all_tokens, dim=0)
     labels = torch.cat(all_labels, dim=0)
+    topk_values = torch.cat(all_topk_values, dim=0)
+    topk_indices = torch.cat(all_topk_indices, dim=0)
 
     shard_path = output_dir / f"shard{rank_suffix}_{shard_idx:04d}.pt"
     torch.save({
-        "target_hidden": hidden,  # (num_blocks, hidden_dim) fp16
-        "future_tokens": tokens,  # (num_blocks, block_size) int32
-        "labels": labels,         # (num_blocks, block_size) int32, with -100 for masked
+        "target_hidden": hidden,      # (num_blocks, hidden_dim) fp16
+        "future_tokens": tokens,      # (num_blocks, block_size) int32
+        "labels": labels,             # (num_blocks, block_size) int32, with -100 for masked
+        "topk_values": topk_values,   # (num_blocks, block_size-1, top_k) fp16
+        "topk_indices": topk_indices, # (num_blocks, block_size-1, top_k) int32
     }, shard_path)
 
     # Count masked tokens in this shard

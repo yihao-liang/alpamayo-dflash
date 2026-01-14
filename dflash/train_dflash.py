@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """Offline distillation: Train DFlash drafter on pre-computed hidden states.
 
-Uses pre-generated distillation data (target_hidden, future_tokens pairs) for fast training.
+Uses pre-generated distillation data (target_hidden, future_tokens, top_k_logits) for fast training.
 No need to load Alpamayo during training - only DFlash is trained.
+
+Supports:
+- CE loss: Cross-entropy on actual tokens (default)
+- KL loss: KL divergence using stored top-k logits
+- CE+KL: Combined loss (recommended when top-k logits available)
+
+Key optimization: Prefix-Weighted Cross-Entropy
+- In speculative decoding, earlier tokens are more valuable (wrong first token = entire block rejected)
+- Uses geometric decay weights: w(t) = exp(-t/gamma) to emphasize early positions
+- Tracks first-token accuracy as critical diagnostic for inference acceptance
 
 Usage (Single GPU):
     python train_dflash.py \
         --draft-model /models/Qwen3-8B-DFlash-b16 \
         --data-dir /data/dflash_distillation \
-        --output-dir /exp/dflash_checkpoints
+        --output-dir /exp/dflash_checkpoints \
+        --loss-type ce+kl
 
 Usage (Multi-GPU with torchrun):
     torchrun --nproc_per_node=8 train_dflash.py \
         --draft-model /models/Qwen3-8B-DFlash-b16 \
         --data-dir /data/dflash_distillation \
-        --output-dir /exp/dflash_checkpoints
+        --output-dir /exp/dflash_checkpoints \
+        --loss-type ce+kl
 """
 
 import argparse
@@ -162,16 +174,33 @@ class OfflineDistillationDataset(Dataset):
         all_tokens = []
         all_labels = []
 
+        all_topk_values = []
+        all_topk_indices = []
+
         for shard_path in my_shard_files:
             data = torch.load(shard_path, map_location="cpu")
             all_hidden.append(data["target_hidden"])
             all_tokens.append(data["future_tokens"])
             # Labels with -100 for extended vocab tokens (vocab_size >= 151936)
             all_labels.append(data.get("labels", data["future_tokens"]))  # fallback for old data
+            # Top-k logits for KL loss (optional, may not exist in old data)
+            if "topk_values" in data:
+                all_topk_values.append(data["topk_values"])
+                all_topk_indices.append(data["topk_indices"])
 
         target_hidden = torch.cat(all_hidden, dim=0)
         future_tokens = torch.cat(all_tokens, dim=0)
         labels = torch.cat(all_labels, dim=0)
+
+        # Top-k logits (optional)
+        if all_topk_values:
+            topk_values = torch.cat(all_topk_values, dim=0)
+            topk_indices = torch.cat(all_topk_indices, dim=0)
+            self.has_topk_logits = True
+        else:
+            topk_values = None
+            topk_indices = None
+            self.has_topk_logits = False
 
         # Train/val split with fixed seed for reproducibility
         n_total = target_hidden.shape[0]
@@ -191,6 +220,14 @@ class OfflineDistillationDataset(Dataset):
         self.future_tokens = future_tokens[indices]
         self.labels = labels[indices]
 
+        # Top-k logits (optional)
+        if self.has_topk_logits:
+            self.topk_values = topk_values[indices]
+            self.topk_indices = topk_indices[indices]
+        else:
+            self.topk_values = None
+            self.topk_indices = None
+
         # Report stats
         log_rank = rank if rank >= 0 else 0
         logger.info(f"[Rank {log_rank}] {split}: {len(self)} blocks (from {n_total} total)")
@@ -198,28 +235,39 @@ class OfflineDistillationDataset(Dataset):
         total_count = self.labels.numel()
         if total_count > 0:
             logger.info(f"[Rank {log_rank}] {split}: masked tokens {masked_count}/{total_count} ({100*masked_count/total_count:.1f}%)")
+        if self.has_topk_logits:
+            logger.info(f"[Rank {log_rank}] {split}: top-k logits available (k={self.topk_values.shape[-1]})")
 
     def __len__(self):
         return self.target_hidden.shape[0]
 
     def __getitem__(self, idx):
-        return {
+        item = {
             "target_hidden": self.target_hidden[idx],
             "future_tokens": self.future_tokens[idx],
             "labels": self.labels[idx],
         }
+        if self.has_topk_logits:
+            item["topk_values"] = self.topk_values[idx]
+            item["topk_indices"] = self.topk_indices[idx]
+        return item
 
 
 # ============== Trainer ==============
 
 class OfflineDistillationTrainer:
-    """Trainer for offline distillation using discrete MASK tokens and cross-entropy loss.
+    """Trainer for offline distillation using discrete MASK tokens and CE/KL loss.
 
     This matches the inference procedure:
     - Input: [context_token, MASK, MASK, ...]
     - DFlash predicts hidden states
     - lm_head converts to logits
-    - Cross-entropy loss on actual tokens
+    - Cross-entropy and/or KL loss
+
+    Loss types:
+    - ce: Cross-entropy on actual tokens (default)
+    - kl: KL divergence using stored top-k logits
+    - ce+kl: Combined loss (recommended when top-k logits available)
     """
 
     def __init__(
@@ -232,8 +280,15 @@ class OfflineDistillationTrainer:
         learning_rate: float = 1e-4,
         weight_decay: float = 0.01,
         warmup_steps: int = 1000,
+        total_steps: int = 10000,
         local_rank: int = 0,
         world_size: int = 1,
+        loss_type: str = "ce",
+        ce_weight_start: float = 1.0,
+        ce_weight_end: float = 0.8,
+        kl_temperature: float = 1.0,
+        prefix_weight_gamma: float = 1.5,
+        target_layer_ids: list[int] | None = None,
     ):
         self.local_rank = local_rank
         self.world_size = world_size
@@ -268,16 +323,23 @@ class OfflineDistillationTrainer:
 
         self.block_size = block_size
 
+        # Loss configuration
+        self.loss_type = loss_type
+        self.ce_weight_start = ce_weight_start
+        self.ce_weight_end = ce_weight_end
+        self.kl_temperature = kl_temperature
+        self.prefix_weight_gamma = prefix_weight_gamma
+        self.total_steps = total_steps
+
         # Optimizer
-        scaled_lr = learning_rate * world_size
         self.optimizer = torch.optim.AdamW(
             self.draft_model.parameters(),
-            lr=scaled_lr,
+            lr=learning_rate,
             betas=(0.9, 0.999),
             weight_decay=weight_decay,
         )
 
-        self.base_lr = scaled_lr
+        self.base_lr = learning_rate
         self.warmup_steps = warmup_steps
         self.global_step = 0
 
@@ -294,14 +356,62 @@ class OfflineDistillationTrainer:
             param_group['lr'] = lr
         return lr
 
+    def get_ce_kl_weights(self) -> tuple[float, float]:
+        """Get dynamic CE/KL weights based on training progress.
+
+        Uses cosine schedule to transition from CE-dominated to balanced:
+        - Start: ce_weight_start (e.g., 0.9), kl = 1 - ce
+        - End: ce_weight_end (e.g., 0.5), kl = 1 - ce
+
+        This allows the model to first learn hard targets (CE) then
+        refine distribution matching (KL).
+        """
+        progress = min(1.0, self.global_step / max(1, self.total_steps))
+        # Cosine schedule for smooth transition
+        ce_weight = self.ce_weight_end + 0.5 * (self.ce_weight_start - self.ce_weight_end) * (1 + math.cos(math.pi * progress))
+        kl_weight = 1.0 - ce_weight
+        return ce_weight, kl_weight
+
+    def compute_topk_kl_loss(
+        self,
+        draft_logits: torch.Tensor,
+        topk_values: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute KL loss using stored top-k target logits.
+
+        Args:
+            draft_logits: (B, seq, vocab_size) - draft model logits
+            topk_values: (B, seq, k) - top-k target logit values
+            topk_indices: (B, seq, k) - top-k target logit indices
+
+        Returns:
+            KL divergence loss
+        """
+        # Apply temperature
+        if self.kl_temperature != 1.0:
+            draft_logits = draft_logits / self.kl_temperature
+            topk_values = topk_values / self.kl_temperature
+
+        # Get draft logits at the same indices as target top-k
+        draft_topk = torch.gather(draft_logits, dim=-1, index=topk_indices.long())
+
+        # Compute softmax over top-k (approximation of full distribution)
+        target_probs = F.softmax(topk_values, dim=-1)
+        draft_log_probs = F.log_softmax(draft_topk, dim=-1)
+
+        # KL divergence
+        kl_loss = F.kl_div(draft_log_probs, target_probs, reduction='batchmean', log_target=False)
+        return kl_loss
+
     def train_step(self, batch: dict) -> dict:
-        """Single training step using MASK tokens and cross-entropy loss.
+        """Single training step using MASK tokens and CE/KL loss.
 
         This matches inference:
         1. Input: [first_token, MASK, MASK, ...] embeddings
         2. DFlash predicts hidden states for MASK positions
         3. lm_head converts to logits
-        4. Cross-entropy loss on actual tokens (where labels != -100)
+        4. Cross-entropy and/or KL loss
         """
         self.draft_model.train()
 
@@ -346,16 +456,71 @@ class OfflineDistillationTrainer:
         # Labels for positions 1 to block_size (what the MASKs should predict)
         target_labels = labels[:, 1:]  # (B, block_size-1)
 
-        # Cross-entropy loss (ignores -100 automatically)
-        loss = F.cross_entropy(
+        # Compute losses
+        metrics = {}
+
+        # === Prefix-Weighted Cross-Entropy ===
+        # In speculative decoding, earlier tokens are more valuable:
+        # - Token 1 wrong = entire block discarded
+        # - Token N only matters if all previous tokens are correct
+        # Geometric decay weights emphasize early positions
+
+        # 1. Compute raw CE per position (no reduction)
+        ce_per_token = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             target_labels.reshape(-1),
             ignore_index=-100,
-        )
+            reduction="none"
+        ).view(target_labels.shape)  # (B, T)
+
+        # 2. Construct geometric decay weights
+        # gamma controls decay rate: higher = more emphasis on first token
+        # gamma=1.5: weights ~[1.0, 0.51, 0.26, 0.13, 0.07, 0.03, 0.02, ...]
+        T = target_labels.shape[1]
+        step = torch.arange(T, device=self.device, dtype=logits.dtype)
+        weights = torch.exp(-step / self.prefix_weight_gamma)
+        weights = weights / weights.mean()  # Normalize to keep loss scale stable
+
+        # 3. Apply weights and compute mean loss
+        valid_mask = (target_labels != -100).float()
+        valid_count = valid_mask.sum()
+        if valid_count > 0:
+            weighted_loss = (ce_per_token * weights[None, :] * valid_mask).sum() / valid_count
+        else:
+            weighted_loss = ce_per_token.mean()
+
+        ce_loss = weighted_loss
+        metrics["ce"] = ce_loss.item()
+
+        # KL loss (if top-k logits available and KL enabled)
+        kl_loss = torch.tensor(0.0, device=self.device)
+        if "kl" in self.loss_type and "topk_values" in batch:
+            topk_values = batch["topk_values"].to(self.device, dtype=model_dtype)
+            topk_indices = batch["topk_indices"].to(self.device)
+            kl_loss = self.compute_topk_kl_loss(logits, topk_values, topk_indices)
+            metrics["kl"] = kl_loss.item()
+
+        # Combined loss with dynamic CE/KL weights
+        if self.loss_type == "ce":
+            total_loss = ce_loss
+            ce_weight, kl_weight = 1.0, 0.0
+        elif self.loss_type == "kl":
+            total_loss = kl_loss
+            ce_weight, kl_weight = 0.0, 1.0
+        elif self.loss_type == "ce+kl":
+            ce_weight, kl_weight = self.get_ce_kl_weights()
+            total_loss = ce_weight * ce_loss + kl_weight * kl_loss
+        else:
+            total_loss = ce_loss  # fallback
+            ce_weight, kl_weight = 1.0, 0.0
+
+        metrics["loss"] = total_loss.item()
+        metrics["ce_weight"] = ce_weight
+        metrics["kl_weight"] = kl_weight
 
         # Backprop
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.draft_model.parameters(), 1.0)
         self.optimizer.step()
 
@@ -364,14 +529,34 @@ class OfflineDistillationTrainer:
         # Compute accuracy for monitoring
         with torch.no_grad():
             valid_mask = target_labels != -100
+            preds = logits.argmax(dim=-1)
             if valid_mask.sum() > 0:
-                preds = logits.argmax(dim=-1)
                 correct = (preds == target_labels) & valid_mask
                 accuracy = correct.sum().float() / valid_mask.sum().float()
             else:
                 accuracy = torch.tensor(0.0)
 
-        return {"loss": loss.item(), "accuracy": accuracy.item(), "step": self.global_step}
+            # First-token accuracy - critical diagnostic for speculative decoding
+            # If first token is wrong, entire block is rejected regardless of later tokens
+            first_token_valid = valid_mask[:, 0]  # (B,)
+            if first_token_valid.sum() > 0:
+                first_token_correct = (preds[:, 0] == target_labels[:, 0]) & first_token_valid
+                first_token_acc = first_token_correct.sum().float() / first_token_valid.sum().float()
+            else:
+                first_token_acc = torch.tensor(0.0)
+
+            # Prefix accuracy - matches inference acceptance calculation
+            # This measures consecutive correct tokens from position 0, like inference
+            # For samples with -100 labels (trajectory tokens), treat as mismatch for prefix
+            matches_for_prefix = (preds == target_labels) & (target_labels != -100)
+            prefix_lengths = matches_for_prefix.cumprod(dim=1).sum(dim=1)  # (B,)
+            prefix_rate = prefix_lengths.float().mean() / (self.block_size - 1)
+
+        metrics["accuracy"] = accuracy.item()
+        metrics["first_token_acc"] = first_token_acc.item()
+        metrics["prefix_acc"] = prefix_rate.item()
+        metrics["step"] = self.global_step
+        return metrics
 
     def train_epoch(
         self,
@@ -384,6 +569,8 @@ class OfflineDistillationTrainer:
     ) -> dict:
         """Train for one epoch."""
         total_loss = 0
+        total_ce = 0
+        total_kl = 0
         num_batches = 0
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch}", total=max_batches, disable=not is_main_process())
@@ -398,15 +585,34 @@ class OfflineDistillationTrainer:
             # Training step
             metrics = self.train_step(batch)
             total_loss += metrics["loss"]
+            total_ce += metrics.get("ce", 0)
+            total_kl += metrics.get("kl", 0)
             num_batches += 1
 
             if is_main_process():
-                pbar.set_postfix(loss=f"{metrics['loss']:.4f}", acc=f"{metrics['accuracy']:.1%}", lr=f"{lr:.2e}")
+                postfix = {
+                    "loss": f"{metrics['loss']:.4f}",
+                    "t1": f"{metrics['first_token_acc']:.1%}",  # First-token accuracy - critical for acceptance
+                    "pfx": f"{metrics['prefix_acc']:.1%}",  # Prefix accuracy - comparable to inference
+                    "lr": f"{lr:.2e}"
+                }
+                if "kl" in metrics:
+                    postfix["ce"] = f"{metrics['ce']:.4f}"
+                    postfix["kl"] = f"{metrics['kl']:.4f}"
+                    postfix["cw"] = f"{metrics['ce_weight']:.2f}"  # Dynamic CE weight
+                pbar.set_postfix(postfix)
 
                 # Log to tensorboard every log_interval steps
                 if writer is not None and self.global_step % log_interval == 0:
                     writer.add_scalar("train/loss", metrics["loss"], self.global_step)
+                    writer.add_scalar("train/ce_loss", metrics.get("ce", metrics["loss"]), self.global_step)
+                    if "kl" in metrics:
+                        writer.add_scalar("train/kl_loss", metrics["kl"], self.global_step)
+                        writer.add_scalar("train/ce_weight", metrics["ce_weight"], self.global_step)
+                        writer.add_scalar("train/kl_weight", metrics["kl_weight"], self.global_step)
                     writer.add_scalar("train/accuracy", metrics["accuracy"], self.global_step)
+                    writer.add_scalar("train/first_token_accuracy", metrics["first_token_acc"], self.global_step)
+                    writer.add_scalar("train/prefix_accuracy", metrics["prefix_acc"], self.global_step)
                     writer.add_scalar("train/lr", lr, self.global_step)
 
         # Average loss
@@ -424,12 +630,16 @@ class OfflineDistillationTrainer:
 
     @torch.no_grad()
     def validate(self, dataloader: DataLoader, max_batches: int | None = None) -> dict:
-        """Run validation with cross-entropy loss and accuracy."""
+        """Run validation with cross-entropy loss, accuracy, prefix accuracy, and first-token accuracy."""
         self.draft_model.eval()
 
         total_loss = 0
         total_correct = 0
         total_valid = 0
+        total_first_correct = 0
+        total_first_valid = 0
+        total_prefix_len = 0
+        total_samples = 0
         num_batches = 0
 
         model_dtype = next(self.model_without_ddp.parameters()).dtype
@@ -471,28 +681,55 @@ class OfflineDistillationTrainer:
                 ignore_index=-100,
             )
 
-            # Accuracy
+            # Per-token accuracy
             valid_mask = target_labels != -100
+            preds = logits.argmax(dim=-1)
             if valid_mask.sum() > 0:
-                preds = logits.argmax(dim=-1)
                 correct = (preds == target_labels) & valid_mask
                 total_correct += correct.sum().item()
                 total_valid += valid_mask.sum().item()
+
+            # First-token accuracy - critical diagnostic for speculative decoding
+            first_token_valid = valid_mask[:, 0]
+            if first_token_valid.sum() > 0:
+                first_token_correct = (preds[:, 0] == target_labels[:, 0]) & first_token_valid
+                total_first_correct += first_token_correct.sum().item()
+                total_first_valid += first_token_valid.sum().item()
+
+            # Prefix accuracy - matches inference acceptance calculation
+            # Measures consecutive correct tokens from position 0
+            matches_for_prefix = (preds == target_labels) & (target_labels != -100)
+            prefix_lengths = matches_for_prefix.cumprod(dim=1).sum(dim=1)  # (B,)
+            total_prefix_len += prefix_lengths.sum().item()
+            total_samples += batch_size
 
             total_loss += loss.item()
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
         accuracy = total_correct / max(total_valid, 1)
+        first_token_accuracy = total_first_correct / max(total_first_valid, 1)
+        prefix_accuracy = (total_prefix_len / max(total_samples, 1)) / (self.block_size - 1)
 
         # Average across all GPUs
         if self.world_size > 1:
-            stats = torch.tensor([avg_loss, accuracy, total_correct, total_valid], device=self.device)
+            stats = torch.tensor(
+                [avg_loss, total_correct, total_valid, total_prefix_len, total_samples,
+                 total_first_correct, total_first_valid],
+                device=self.device
+            )
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             avg_loss = stats[0].item() / self.world_size
-            accuracy = stats[2].item() / max(stats[3].item(), 1)
+            accuracy = stats[1].item() / max(stats[2].item(), 1)
+            prefix_accuracy = (stats[3].item() / max(stats[4].item(), 1)) / (self.block_size - 1)
+            first_token_accuracy = stats[5].item() / max(stats[6].item(), 1)
 
-        return {"val_loss": avg_loss, "val_accuracy": accuracy}
+        return {
+            "val_loss": avg_loss,
+            "val_accuracy": accuracy,
+            "val_first_token_accuracy": first_token_accuracy,
+            "val_prefix_accuracy": prefix_accuracy,
+        }
 
     def save_checkpoint(self, path: str | Path, epoch: int, val_loss: float | None = None):
         if not is_main_process():
@@ -501,7 +738,17 @@ class OfflineDistillationTrainer:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
+        # Update model config with training parameters before saving
+        # These are critical for correct inference
+        self.model_without_ddp.config.block_size = self.block_size
+        self.model_without_ddp.config.mask_token_id = self.mask_token_id
+
         self.model_without_ddp.save_pretrained(path)
+
+        # Save exact MASK token embedding for inference
+        # This eliminates train-inference mismatch from re-computing vocab mean
+        mask_emb = self.embed_tokens.weight[self.mask_token_id].detach().cpu()
+        torch.save(mask_emb, path / "mask_embedding.pt")
 
         state = {
             "epoch": epoch,
@@ -513,7 +760,7 @@ class OfflineDistillationTrainer:
 
         torch.save(state, path / "training_state.pt")
 
-        logger.info(f"Saved checkpoint to {path}")
+        logger.info(f"Saved checkpoint to {path} (including mask_embedding.pt)")
 
 
 # ============== Main ==============
@@ -546,6 +793,21 @@ def main():
                         help="TensorBoard log directory (default: output_dir/logs)")
     parser.add_argument("--log-interval", type=int, default=10,
                         help="Log to TensorBoard every N steps")
+    # Loss configuration
+    parser.add_argument("--loss-type", type=str, default="ce", choices=["ce", "kl", "ce+kl"],
+                        help="Loss type: ce (cross-entropy), kl (KL div), ce+kl (combined)")
+    parser.add_argument("--ce-weight-start", type=float, default=1.0,
+                        help="Initial CE weight (for ce+kl with dynamic scheduling)")
+    parser.add_argument("--ce-weight-end", type=float, default=0.8,
+                        help="Final CE weight (for ce+kl with dynamic scheduling)")
+    parser.add_argument("--kl-temperature", type=float, default=1.0,
+                        help="Temperature for KL loss")
+    # Prefix-weighted CE
+    parser.add_argument("--prefix-weight-gamma", type=float, default=1.5,
+                        help="Geometric decay coefficient for prefix-weighted CE (higher = more emphasis on early tokens)")
+    # Vocabulary
+    parser.add_argument("--full-vocab", action="store_true",
+                        help="Resize draft model to full target vocab (155698) to support trajectory tokens")
     args = parser.parse_args()
 
     # Setup distributed
@@ -628,6 +890,25 @@ def main():
 
     mask_token_id = tokenizer.mask_token_id
 
+    # Get target vocab size
+    target_vocab_size = embed_tokens.weight.shape[0]
+    draft_vocab_size = draft_model.config.vocab_size if hasattr(draft_model.config, 'vocab_size') else 151936
+
+    if is_main_process():
+        logger.info(f"Target vocab size: {target_vocab_size}")
+        logger.info(f"Draft vocab size: {draft_vocab_size}")
+
+    # Resize draft model vocab if needed (for full vocabulary training)
+    if args.full_vocab and draft_vocab_size < target_vocab_size:
+        if is_main_process():
+            logger.info(f"Resizing draft model vocab: {draft_vocab_size} -> {target_vocab_size}")
+        # DFlash model doesn't have its own embeddings (uses target's embed_tokens)
+        # but we need to update the config for saving
+        if hasattr(draft_model.config, 'vocab_size'):
+            draft_model.config.vocab_size = target_vocab_size
+        if is_main_process():
+            logger.info("Draft model will use target's full vocabulary (including trajectory tokens)")
+
     # Free target model memory (keep only embed_tokens and lm_head)
     del target_model.vlm.model.language_model.layers
     del target_model.vlm.model.visual
@@ -635,6 +916,8 @@ def main():
 
     if is_main_process():
         logger.info(f"MASK token ID: {mask_token_id}")
+        if args.full_vocab:
+            logger.info("Full vocab mode: Training on ALL tokens including trajectory tokens")
 
     # Load train/val datasets with per-GPU sharding (90/10 split)
     train_dataset = OfflineDistillationDataset(
@@ -645,6 +928,13 @@ def main():
         args.data_dir, rank=rank, world_size=world_size,
         split="val", val_ratio=0.1
     )
+
+    # Check if KL loss is requested but top-k logits not available
+    if "kl" in args.loss_type and not train_dataset.has_topk_logits:
+        if is_main_process():
+            logger.warning("KL loss requested but top-k logits not found in data!")
+            logger.warning("Falling back to CE loss only. Re-generate data with --top-k-logits to enable KL loss.")
+        args.loss_type = "ce"
 
     # Create dataloaders
     train_loader = DataLoader(
@@ -704,28 +994,42 @@ def main():
     # Auto-calculate warmup steps (10% of total) if not specified
     warmup_steps = args.warmup_steps if args.warmup_steps is not None else max(10, total_steps // 10)
 
+    # Scale learning rate with world size (linear scaling rule)
+    # Effective batch size = batch_size * world_size, so LR scales proportionally
+    scaled_lr = args.learning_rate * world_size
+
     if is_main_process():
         logger.info(f"Train blocks: {len(train_dataset):,} per GPU, {int(total_train):,} total")
         logger.info(f"Val blocks: {len(val_dataset):,} per GPU, {int(total_val):,} total")
         logger.info(f"Steps per epoch: {steps_per_epoch}")
         logger.info(f"Total steps: {total_steps}")
         logger.info(f"Warmup steps: {warmup_steps} ({'auto 10%' if args.warmup_steps is None else 'manual'})")
+        logger.info(f"Learning rate: {args.learning_rate} x {world_size} GPUs = {scaled_lr}")
 
-    # Create trainer (using MASK tokens + cross-entropy loss)
+    # Create trainer (using MASK tokens + prefix-weighted cross-entropy loss)
     trainer = OfflineDistillationTrainer(
         draft_model=draft_model,
         embed_tokens=embed_tokens,
         lm_head=lm_head,
         mask_token_id=mask_token_id,
         block_size=args.block_size,
-        learning_rate=args.learning_rate,
+        learning_rate=scaled_lr,
         warmup_steps=warmup_steps,
+        total_steps=total_steps,
         local_rank=local_rank,
         world_size=world_size,
+        loss_type=args.loss_type,
+        ce_weight_start=args.ce_weight_start,
+        ce_weight_end=args.ce_weight_end,
+        kl_temperature=args.kl_temperature,
+        prefix_weight_gamma=args.prefix_weight_gamma,
     )
 
     # Training loop
     if is_main_process():
+        logger.info(f"Loss type: {args.loss_type} (prefix-weighted, gamma={args.prefix_weight_gamma})")
+        if args.loss_type == "ce+kl":
+            logger.info(f"CE/KL weights: {args.ce_weight_start:.1f} -> {args.ce_weight_end:.1f} (dynamic schedule)")
         logger.info(f"Starting offline distillation for {args.num_epochs} epochs...")
 
     best_val_loss = float("inf")
@@ -741,16 +1045,23 @@ def main():
         # Validate
         val_metrics = trainer.validate(val_loader, max_batches=max_val_batches)
         val_loss = val_metrics["val_loss"]
-
         val_acc = val_metrics.get("val_accuracy", 0)
+        val_t1_acc = val_metrics.get("val_first_token_accuracy", 0)
+        val_prefix_acc = val_metrics.get("val_prefix_accuracy", 0)
 
         if is_main_process():
-            logger.info(f"Epoch {epoch}: train_loss={train_metrics['avg_loss']:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.1%}")
+            # Log first-token accuracy (critical), prefix accuracy (comparable to inference)
+            logger.info(
+                f"Epoch {epoch}: train_loss={train_metrics['avg_loss']:.4f}, "
+                f"val_loss={val_loss:.4f}, val_t1={val_t1_acc:.1%}, val_prefix={val_prefix_acc:.1%}"
+            )
 
             # Log to TensorBoard
             if writer is not None:
                 writer.add_scalar("val/loss", val_loss, epoch)
                 writer.add_scalar("val/accuracy", val_acc, epoch)
+                writer.add_scalar("val/first_token_accuracy", val_t1_acc, epoch)
+                writer.add_scalar("val/prefix_accuracy", val_prefix_acc, epoch)
 
         # Save checkpoint
         if epoch % args.save_every == 0:
@@ -773,12 +1084,17 @@ def main():
         with open(output_dir / "config.json", "w") as f:
             json.dump({
                 "mode": "offline_distillation",
-                "loss_type": "cross_entropy",  # Now using CE instead of MSE
+                "loss_type": args.loss_type,
+                "prefix_weighted_ce": True,  # Geometric decay to emphasize early tokens
+                "prefix_weight_gamma": args.prefix_weight_gamma,
+                "ce_weight_start": args.ce_weight_start,
+                "ce_weight_end": args.ce_weight_end,
                 "draft_model": args.draft_model,
                 "data_dir": args.data_dir,
                 "block_size": args.block_size,
                 "num_epochs": args.num_epochs,
-                "learning_rate": args.learning_rate,
+                "base_learning_rate": args.learning_rate,
+                "scaled_learning_rate": scaled_lr,
                 "batch_size": args.batch_size,
                 "world_size": world_size,
                 "train_blocks": int(total_train),

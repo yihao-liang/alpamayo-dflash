@@ -359,14 +359,15 @@ class DFlashAlpamayoAccelerator:
             if mask_id == vocab_size:
                 logger.info(f"[DFlash] Resizing embeddings from {vocab_size} to {vocab_size + 1} for mask token")
                 self.target_vlm.resize_token_embeddings(vocab_size + 1)
-                # Initialize new embedding to mean for stability
-                if self.config.init_mask_to_mean:
-                    self._init_mask_embedding_to_mean(mask_id)
             elif mask_id > vocab_size:
                 raise ValueError(
                     f"mask_token_id_override={mask_id} is out of vocabulary range ({vocab_size}). "
                     "Ensure the ID matches the token used during DFlash training."
                 )
+            # CRITICAL: Always reset mask embedding to mean to match training distribution
+            if self.config.init_mask_to_mean:
+                logger.info(f"[DFlash] Resetting mask token {mask_id} embedding to vocab mean (matching training)")
+                self._init_mask_embedding_to_mean(mask_id)
             logger.info(f"[DFlash] Using override mask_token_id={mask_id}")
             return mask_id
 
@@ -376,6 +377,10 @@ class DFlashAlpamayoAccelerator:
                 f"[DFlash] Using existing mask token: {self.tokenizer.mask_token} "
                 f"(ID: {self.tokenizer.mask_token_id})"
             )
+            # CRITICAL: Reset existing mask embedding to mean to match training distribution
+            if self.config.init_mask_to_mean:
+                logger.info(f"[DFlash] Resetting mask token {self.tokenizer.mask_token_id} embedding to vocab mean (matching training)")
+                self._init_mask_embedding_to_mean(self.tokenizer.mask_token_id)
             return self.tokenizer.mask_token_id
 
         # Option 3: Try to find a reserved token that DFlash might have used
@@ -389,6 +394,10 @@ class DFlashAlpamayoAccelerator:
                         "If draft quality is poor, verify this matches the DFlash training config."
                     )
                     self.tokenizer.mask_token = reserved_token
+                    # CRITICAL: Reset reserved token embedding to mean to match training distribution
+                    if self.config.init_mask_to_mean:
+                        logger.info(f"[DFlash] Resetting reserved token {token_id} embedding to vocab mean (matching training)")
+                        self._init_mask_embedding_to_mean(token_id)
                     return token_id
             except Exception:
                 continue
@@ -638,27 +647,32 @@ class DFlashAlpamayoAccelerator:
             ]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
-            # Update position
+            # Check for stop tokens BEFORE updating position
+            # The last accepted token is posterior[0, acceptance_length]
+            last_accepted_token = posterior[0, acceptance_length].item()
+            hit_stop = stop_token_ids is not None and last_accepted_token in stop_token_ids
+
+            # Update position and stats
             start += acceptance_length + 1
             stats.acceptance_lengths.append(acceptance_length + 1)
             stats.total_iterations += 1
 
+            # Stop immediately if we hit stop token
+            if hit_stop:
+                break
+
             # Update caches - crop to the new valid length
             past_key_values_target.crop(start)
 
-            # 6. Do not accumulate target_hidden
-            # Extract hidden states from verification output and keep only the lastvalid position. This matches training where DFlash sees single-token context. The hidden state at position `acceptance_length` is which contains compressed information about all prior context through Alpamayo's self-attention.
+            # Extract hidden state for next iteration's context.
+            # hidden[acceptance_length] is at absolute position (old_start + acceptance_length),
+            # which equals (new_start - 1) - exactly what we need as context BEFORE the next block.
+            # Due to causal attention, this hidden state only depends on positions 0..acceptance_length
+            # (all correctly accepted tokens), unaffected by wrong tokens at later positions.
             new_hidden = extract_context_feature(
                 verify_output.hidden_states, self.target_layer_ids
             )
-            # Keep only the last valid hidden state (at acceptance_length position)
             target_hidden = new_hidden[:, acceptance_length : acceptance_length + 1, :]
-
-            # Check for stop tokens
-            if stop_token_ids is not None:
-                generated = output_ids[0, num_input_tokens:start]
-                if any(stop_id in generated for stop_id in stop_token_ids):
-                    break
 
         stats.decode_time_ms = (time.perf_counter() - decode_start) * 1000
 
@@ -810,5 +824,28 @@ def create_dflash_accelerator(
         tokenizer=alpamayo_model.tokenizer,
         config=config,
     )
+
+    # Load exact MASK embedding from training if available
+    # This eliminates train-inference mismatch from re-computing vocab mean
+    draft_path = Path(draft_model_name_or_path)
+    mask_emb_file = draft_path / "mask_embedding.pt"
+
+    if mask_emb_file.exists():
+        logger.info(f"[DFlash] Loading exact mask embedding from {mask_emb_file}")
+        mask_emb = torch.load(mask_emb_file, map_location=device)
+
+        # Ensure dtype compatibility
+        mask_emb = mask_emb.to(dtype=alpamayo_model.vlm.get_input_embeddings().weight.dtype)
+
+        # Overwrite the mask embedding with the exact one from training
+        with torch.no_grad():
+            alpamayo_model.vlm.get_input_embeddings().weight[accelerator.mask_token_id] = mask_emb
+
+        logger.info(f"[DFlash] Loaded exact mask embedding for token ID {accelerator.mask_token_id}")
+    else:
+        logger.warning(
+            f"[DFlash] No mask_embedding.pt found in {draft_path}. "
+            "Using vocabulary mean initialization (may cause train-inference mismatch)."
+        )
 
     return accelerator

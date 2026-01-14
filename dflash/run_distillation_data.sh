@@ -5,10 +5,10 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NUM_CHUNKS="${1:-256}"  # 10 chunks per GPU * 8 GPUs
+NUM_CHUNKS="${1:-400}"
 OUTPUT_DIR="${2:-/data/dflash_distillation}"
 TARGET_LAYERS="${3:-24,30,31,32,34}"
-STRIDE="${4:-1}"  # stride=1 to include boundary position
+STRIDE="${4:-1}"
 NUM_GPUS=8
 CHUNKS_PER_GPU=$((NUM_CHUNKS / NUM_GPUS))
 
@@ -31,13 +31,15 @@ for rank in {0..7}; do
 
     echo "Starting rank ${rank}: chunks ${START}-$((END - 1))..."
 
-    python "${SCRIPT_DIR}/generate_distillation_data.py" \
+    CUDA_VISIBLE_DEVICES=${rank} python "${SCRIPT_DIR}/generate_distillation_data.py" \
         --rank ${rank} \
         --start-chunk ${START} \
         --end-chunk ${END} \
         --output-dir "${OUTPUT_DIR}" \
         --target-layers "${TARGET_LAYERS}" \
         --stride ${STRIDE} \
+        --top-k-logits 128 \
+        --full-vocab \
         2>&1 | tee "${OUTPUT_DIR}/rank${rank}.log" &
 done
 
