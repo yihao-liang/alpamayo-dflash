@@ -9,7 +9,7 @@ Usage:
         --cache-dir /data/physicalai_av/hf_cache \
         --output-dir /data/dflash_distillation \
         --num-chunks 400 \
-        --stride 4 \
+        --stride 1 \
         --top-k-logits 128
 """
 
@@ -111,15 +111,21 @@ def extract_hidden_states_and_tokens(
     # We need to run a forward pass to get hidden states
     vlm = model.vlm
 
-    # Get full input_ids (input + generated CoC)
+    # Get full input_ids (input + generated CoC + <|cot_end|>)
     # The CoC text is in extra["cot"]
     cot_text = extra["cot"][0][0][0] if extra.get("cot") is not None else ""
     cot_tokens = model.tokenizer(cot_text, add_special_tokens=False, return_tensors="pt")["input_ids"]
 
-    # Combine input + CoC tokens
+    # Get <|cot_end|> token ID to append after CoC text
+    # This teaches the drafter when to stop generating CoC
+    cot_end_token_id = model.tokenizer.convert_tokens_to_ids("<|cot_end|>")
+    cot_end_token = torch.tensor([[cot_end_token_id]], dtype=cot_tokens.dtype)
+
+    # Combine input + CoC tokens + <|cot_end|>
     full_input_ids = torch.cat([
         inputs["input_ids"].to(device),
-        cot_tokens.to(device)
+        cot_tokens.to(device),
+        cot_end_token.to(device),
     ], dim=-1)
 
     # Forward pass to get hidden states
@@ -159,14 +165,20 @@ def extract_hidden_states_and_tokens(
     return target_hidden[0], full_input_ids[0], input_len, logits
 
 
-def mask_extended_vocab_tokens(tokens: torch.Tensor, mask_extended: bool = True) -> torch.Tensor:
+def mask_extended_vocab_tokens(
+    tokens: torch.Tensor,
+    mask_extended: bool = True,
+    keep_token_ids: list[int] | None = None,
+) -> torch.Tensor:
     """Optionally mask tokens outside standard Qwen3 vocabulary with IGNORE_INDEX.
 
     Alpamayo extends the vocabulary with trajectory tokens (>= 151936).
+    Special tokens like <|cot_end|> should NOT be masked so the model learns them.
 
     Args:
         tokens: Token IDs tensor
         mask_extended: If True, mask extended vocab tokens. If False, keep all tokens.
+        keep_token_ids: List of token IDs to NOT mask (e.g., special tokens like <|cot_end|>)
 
     Returns:
         Labels tensor (with extended tokens replaced by IGNORE_INDEX if mask_extended=True)
@@ -176,6 +188,12 @@ def mask_extended_vocab_tokens(tokens: torch.Tensor, mask_extended: bool = True)
 
     labels = tokens.clone()
     mask = labels >= STANDARD_VOCAB_SIZE
+
+    # Don't mask special tokens that we want to train on
+    if keep_token_ids is not None:
+        for tok_id in keep_token_ids:
+            mask = mask & (labels != tok_id)
+
     if mask.any():
         labels[mask] = IGNORE_INDEX
     return labels
@@ -190,6 +208,7 @@ def create_training_blocks(
     stride: int = 1,
     top_k_logits: int = 128,
     mask_extended_vocab: bool = True,
+    keep_token_ids: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Create (hidden_state, future_tokens, labels, top_k_logits) tuples with sliding window.
 
@@ -202,6 +221,7 @@ def create_training_blocks(
         stride: step size for sliding window
         top_k_logits: number of top logits to store per position
         mask_extended_vocab: If True, mask trajectory tokens. If False, train on full vocab.
+        keep_token_ids: List of token IDs to NOT mask (e.g., special tokens like <|cot_end|>)
 
     Returns:
         block_hidden: (num_blocks, hidden_dim) - target model hidden states
@@ -222,14 +242,20 @@ def create_training_blocks(
 
     positions = list(range(start_pos, end_pos, stride))
 
-    # When stride > 1, ensure the prompt/generation boundary position is included.
-    # This is where inference starts: hidden state at last prompt token,
-    # predicting first block_size tokens of generation.
+    # When stride > 1, ensure critical positions are included:
     if stride > 1:
+        # 1. Prompt/generation boundary position (where inference starts)
         boundary_pos = generation_start_idx - 1
         if boundary_pos >= 0 and boundary_pos not in positions and boundary_pos < end_pos:
             positions.append(boundary_pos)
-            positions.sort()
+
+        # 2. End-of-CoC position (to capture <|cot_end|> token)
+        # This is the last position that has block_size tokens ahead
+        end_coc_pos = seq_len - block_size - 1
+        if end_coc_pos >= 0 and end_coc_pos not in positions and end_coc_pos < end_pos:
+            positions.append(end_coc_pos)
+
+        positions.sort()
 
     block_hidden = []
     block_tokens = []
@@ -242,7 +268,10 @@ def create_training_blocks(
         tokens = input_ids[pos + 1 : pos + 1 + block_size]
         block_tokens.append(tokens)
         # Optionally mask extended vocab tokens (trajectory tokens > 151936)
-        block_labels.append(mask_extended_vocab_tokens(tokens, mask_extended=mask_extended_vocab))
+        # But keep special tokens like <|cot_end|> so the model learns when to stop
+        block_labels.append(mask_extended_vocab_tokens(
+            tokens, mask_extended=mask_extended_vocab, keep_token_ids=keep_token_ids
+        ))
 
         # Extract top-k logits for positions 1 to block_size (predicting tokens 2 to block_size)
         # logits[pos] predicts token at pos+1, so logits[pos:pos+block_size-1] predict tokens pos+1 to pos+block_size-1
@@ -308,7 +337,7 @@ def main():
     parser.add_argument(
         "--stride",
         type=int,
-        default=4,
+        default=1,
         help="Stride for sliding window (default: 4)",
     )
     parser.add_argument(
@@ -368,6 +397,12 @@ def main():
     model.eval()
     processor = helper.get_processor(model.tokenizer)
 
+    # Get special token IDs to keep (not mask) during training
+    # <|cot_end|> must be trained so the model learns when to stop CoC generation
+    cot_end_id = model.tokenizer.convert_tokens_to_ids("<|cot_end|>")
+    keep_token_ids = [cot_end_id]
+    logger.info(f"[Rank {args.rank}] Keep token IDs (not masked): {keep_token_ids} (<|cot_end|>={cot_end_id})")
+
     # Load dataset interface
     logger.info(f"[Rank {args.rank}] Loading dataset interface...")
     avdi = physical_ai_av.PhysicalAIAVDatasetInterface(cache_dir=args.cache_dir)
@@ -417,6 +452,7 @@ def main():
             )
 
             # Create training blocks with top-k logits
+            # Pass keep_token_ids so <|cot_end|> is not masked
             block_hidden, block_tokens, block_labels, block_topk_vals, block_topk_inds = create_training_blocks(
                 hidden_states.cpu(),
                 input_ids.cpu(),
@@ -426,6 +462,7 @@ def main():
                 stride=args.stride,
                 top_k_logits=args.top_k_logits,
                 mask_extended_vocab=not args.full_vocab,
+                keep_token_ids=keep_token_ids,
             )
 
             if block_hidden is not None:
