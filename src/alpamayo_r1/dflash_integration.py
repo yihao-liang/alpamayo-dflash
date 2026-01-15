@@ -241,6 +241,8 @@ class GenerationStats:
     total_tokens: int = 0
     total_iterations: int = 0
     acceptance_lengths: list[int] = field(default_factory=list)
+    draft_matches: list[int] = field(default_factory=list)  # actual draft tokens accepted (for accurate rate)
+    drafting_iterations: int = 0  # iterations where draft model was actually used
     prefill_time_ms: float = 0.0
     decode_time_ms: float = 0.0
     block_size: int = 8  # Must match accelerator's block_size
@@ -255,11 +257,11 @@ class GenerationStats:
     @property
     def acceptance_rate(self) -> float:
         """Fraction of drafted tokens that were accepted."""
-        if not self.acceptance_lengths:
+        if self.drafting_iterations == 0:
             return 0.0
-        # Each iteration drafts block_size-1 tokens, accepts acceptance_length-1 + 1 from target
-        total_drafted = len(self.acceptance_lengths) * (self.block_size - 1)
-        total_accepted = sum(max(0, a - 1) for a in self.acceptance_lengths)
+        # Only count iterations where draft model was actually used
+        total_drafted = self.drafting_iterations * (self.block_size - 1)
+        total_accepted = sum(self.draft_matches)
         return total_accepted / total_drafted if total_drafted > 0 else 0.0
 
 
@@ -570,10 +572,21 @@ class DFlashAlpamayoAccelerator:
         # ====== DECODE STAGE ======
         decode_start = time.perf_counter()
         start = num_input_tokens
+        period_token_id = 13  # "." token for heuristics
 
         while start < max_length:
             # 1. Prepare the block (first token is known, rest are masks)
             block_output_ids = output_ids[:, start : start + block_size].clone()
+            first_in_block = block_output_ids[0, 0].item()
+
+            # Heuristic: if first_in_block is ".", directly append <|cot_end|> and stop
+            # No need to run draft model - we know the answer
+            # Note: don't update any stats here - this isn't a "real" speculative decoding step
+            # (matches verbose mode behavior which doesn't add a step to `steps` list)
+            if stop_token_ids is not None and first_in_block == period_token_id:
+                output_ids[:, start + 1] = stop_token_ids[0]  # Append <|cot_end|>
+                start += 2  # Move past "." and "<|cot_end|>"
+                break
 
             # Compute position IDs for TARGET MODEL verification (uses absolute positions)
             # For MROPE (Qwen2-VL/Qwen3-VL), position_ids should be 3D: (3, batch, seq_len)
@@ -623,6 +636,19 @@ class DFlashAlpamayoAccelerator:
                 draft_logits, temperature, self._logits_processor
             )
 
+            # Heuristic: if draft predicts <|cot_end|> without preceding ".", replace with "."
+            # This fixes cases where draft skips "." and jumps to <|cot_end|>
+            # The next step will then have first_in_block="." and directly append <|cot_end|>
+            if stop_token_ids is not None:
+                draft_list = block_output_ids[0, 1:].tolist()
+                for i, tok in enumerate(draft_list):
+                    if tok in stop_token_ids:  # Found stop token (e.g., <|cot_end|>)
+                        prev_tok = block_output_ids[0, i].item()
+                        if prev_tok != period_token_id:
+                            # Replace <|cot_end|> with "." - next step will handle it
+                            block_output_ids[0, i + 1] = period_token_id
+                        break
+
             # Verify: Run target model on the drafted block
             verify_output = self.target_vlm(
                 input_ids=block_output_ids,
@@ -647,68 +673,59 @@ class DFlashAlpamayoAccelerator:
             ]
             output_ids[:, start + acceptance_length + 1] = posterior[:, acceptance_length]
 
-            # Check for stop tokens BEFORE updating position
-            # The last accepted token is posterior[0, acceptance_length]
-            last_accepted_token = posterior[0, acceptance_length].item()
-            hit_stop = stop_token_ids is not None and last_accepted_token in stop_token_ids
+            # Check for stop tokens in the ENTIRE accepted sequence, not just the last token
+            # This handles cases where <|cot_end|> appears mid-block
+            hit_stop = False
+            stop_position = None
+            tokens_to_advance = acceptance_length + 1  # default: acceptance_length drafts + 1 posterior
+            if stop_token_ids is not None:
+                accepted_tokens = output_ids[0, start : start + acceptance_length + 2].tolist()
+                for i, tok_id in enumerate(accepted_tokens):
+                    if tok_id in stop_token_ids:
+                        hit_stop = True
+                        stop_position = i
+                        tokens_to_advance = i  # stop at index i means we advance i positions (0 to i-1, then stop at i)
+                        # Clear tokens after stop token
+                        if i < len(accepted_tokens) - 1:
+                            output_ids[:, start + i + 1:] = self.mask_token_id
+                        break
 
             # Update position and stats
-            start += acceptance_length + 1
-            stats.acceptance_lengths.append(acceptance_length + 1)
+            # tokens_to_advance already includes the +1 for posterior token
+            start += tokens_to_advance
+            stats.acceptance_lengths.append(tokens_to_advance)
+            # draft_matches: if stop token found, use stop_position (capped at block_size-1)
+            # otherwise use acceptance_length
+            if hit_stop and stop_position is not None:
+                stats.draft_matches.append(min(stop_position, block_size - 1))
+            else:
+                stats.draft_matches.append(acceptance_length)
+            stats.drafting_iterations += 1
             stats.total_iterations += 1
 
             # Stop immediately if we hit stop token
             if hit_stop:
                 break
 
-            # Update caches - crop to the new valid length
+            # Update KV cache - crop to keep only valid positions
+            # After acceptance, we have tokens at positions [0..start-1] where start is the NEW value
+            # The cache should contain positions 0 to (start - 1), which is exactly what crop(start) does
             past_key_values_target.crop(start)
 
             # Extract hidden state for next iteration's context.
-            # CRITICAL: When a rejection occurs, the hidden state at position acceptance_length
-            # in verify_output was computed under the WRONG draft token, not the correction token.
-            # We must run a "correction pass" to get the true hidden state.
-
-            if acceptance_length == block_size - 1:
-                # Full match (all drafted tokens accepted): hidden state is correct
-                new_hidden = extract_context_feature(
-                    verify_output.hidden_states, self.target_layer_ids
-                )
-                target_hidden = new_hidden[:, -1:, :]
-            else:
-                # Rejection occurred: hidden state at acceptance_length is WRONG
-                # (computed under draft token, but we need hidden for correction token)
-                # Run correction pass on the actual accepted token
-
-                # The correction token is at position (start - 1) in output_ids
-                correction_token_id = output_ids[:, start - 1 : start]  # (B, 1)
-
-                # Prepare position IDs for the correction token
-                correction_pos = start - 1
-                if rope_deltas is not None:
-                    # MROPE: Create 3D position IDs
-                    corr_pos_tensor = torch.tensor([correction_pos], device=device, dtype=torch.long)
-                    corr_position_ids = corr_pos_tensor.view(1, 1, 1).expand(3, bsz, 1).clone()
-                    corr_position_ids = corr_position_ids + rope_deltas.unsqueeze(-1).to(
-                        dtype=torch.long, device=device
-                    )
-                else:
-                    corr_position_ids = torch.tensor([[correction_pos]], device=device, dtype=torch.long)
-
-                # Run correction pass to get true hidden state
-                correction_output = self.target_vlm(
-                    input_ids=correction_token_id,
-                    position_ids=corr_position_ids,
-                    past_key_values=past_key_values_target,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-
-                # Extract hidden state from correction pass
-                new_hidden = extract_context_feature(
-                    correction_output.hidden_states, self.target_layer_ids
-                )
-                target_hidden = new_hidden[:, -1:, :]
+            #
+            # Key insight: In verify_output, the hidden at index `acceptance_length` was computed
+            # using ONLY accepted tokens [known, draft_1, ..., draft_{acceptance_length}].
+            # Due to causal attention, this hidden state does NOT see the rejected draft tokens
+            # at later positions. Therefore, it's CORRECT and we can use it directly.
+            #
+            # - Full match (acceptance_length = block_size - 1): use hidden at index -1
+            # - Rejection (acceptance_length < block_size - 1): use hidden at index acceptance_length
+            # Both cases unify to: hidden at index acceptance_length
+            new_hidden = extract_context_feature(
+                verify_output.hidden_states, self.target_layer_ids
+            )
+            target_hidden = new_hidden[:, acceptance_length : acceptance_length + 1, :]
 
         stats.decode_time_ms = (time.perf_counter() - decode_start) * 1000
 

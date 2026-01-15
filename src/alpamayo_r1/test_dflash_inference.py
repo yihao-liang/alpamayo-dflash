@@ -207,6 +207,7 @@ def run_dflash_inference_verbose(
     log("DFLASH INFERENCE - VERBOSE DEBUG MODE")
     log("=" * 80)
     log(f"Block size: {block_size}")
+    log(f"Target layer IDs: {target_layer_ids}")
     log(f"Mask token ID: {mask_token_id}")
     log(f"Max new tokens: {max_tokens}")
     log()
@@ -239,6 +240,11 @@ def run_dflash_inference_verbose(
     full_hidden = extract_context_feature(prefill_output.hidden_states, target_layer_ids)
     target_hidden = full_hidden[:, -1:, :]
 
+    # Debug: show prefill context stats
+    prefill_norm = target_hidden.norm().item()
+    prefill_mean = target_hidden.mean().item()
+    prefill_std = target_hidden.std().item()
+    log(f"[Prefill context: norm={prefill_norm:.2f}, mean={prefill_mean:.4f}, std={prefill_std:.4f}]")
     log(f"Input length: {num_input_tokens}")
     log()
 
@@ -258,6 +264,16 @@ def run_dflash_inference_verbose(
 
         log(f"  First token in block: {first_in_block} = '{first_in_block_str}'")
 
+        # Heuristic: if first_in_block is "." (13), directly append <|cot_end|> and stop
+        # No need to run draft model - we know the answer
+        # Note: don't add a step to `steps` list - this isn't a "real" speculative decoding step
+        period_token_id = 13
+        if first_in_block == period_token_id:
+            log(f"  [Heuristic: '.' detected, directly appending <|cot_end|> and stopping]")
+            output_ids[:, start_pos + 1] = stop_token_id
+            start_pos += 2  # Move past "." and "<|cot_end|>"
+            break  # Stop generation
+
         # Position IDs for target model
         block_positions = torch.arange(start_pos, start_pos + block_size, device=device)
         if rope_deltas is not None:
@@ -273,6 +289,12 @@ def run_dflash_inference_verbose(
         noise_embedding = accelerator._embed_tokens(block_output_ids)
         current_context = target_hidden[:, -1:, :]
 
+        # Debug: Check context features going into draft model
+        ctx_norm = current_context.norm().item()
+        ctx_mean = current_context.mean().item()
+        ctx_std = current_context.std().item()
+        log(f"  [Draft input context: norm={ctx_norm:.2f}, mean={ctx_mean:.4f}, std={ctx_std:.4f}]")
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
             draft_hidden = accelerator.draft_model(
                 target_hidden=current_context,
@@ -283,10 +305,30 @@ def run_dflash_inference_verbose(
                 is_causal=False,
             )
 
+        # Debug: Check draft hidden states
+        draft_hidden_norm = draft_hidden.norm().item()
+        draft_hidden_mean = draft_hidden.mean().item()
+        draft_hidden_std = draft_hidden.std().item()
+        log(f"  [Draft output hidden: norm={draft_hidden_norm:.2f}, mean={draft_hidden_mean:.4f}, std={draft_hidden_std:.4f}]")
+
         # Get draft predictions
         draft_logits = accelerator._lm_head(draft_hidden[:, 1:, :])
         draft_tokens = sample_tokens(draft_logits, temperature, accelerator._logits_processor)
         block_output_ids[:, 1:] = draft_tokens
+
+        # Heuristic: if draft predicts <|cot_end|> without preceding ".", replace it with "."
+        # This fixes cases where draft skips "." and jumps to <|cot_end|>
+        # The next step will then have first_in_block="." and directly append <|cot_end|>
+        draft_list = block_output_ids[0, 1:].tolist()
+        for i, tok in enumerate(draft_list):
+            if tok == stop_token_id:  # Found <|cot_end|>
+                # Check if previous token is "."
+                prev_tok = block_output_ids[0, i].item()  # i because block_output_ids includes first_in_block at 0
+                if prev_tok != period_token_id:
+                    # Replace <|cot_end|> with "." - next step will add <|cot_end|> after "."
+                    block_output_ids[0, i + 1] = period_token_id
+                    log(f"  [Heuristic: replacing <|cot_end|> with '.' at position {i+1}]")
+                break
 
         # Decode draft tokens for display
         draft_token_ids = block_output_ids[0].tolist()
@@ -330,10 +372,36 @@ def run_dflash_inference_verbose(
         log(f"  Final accepted IDs:  {accepted_ids}")
         log(f"  Final accepted text: {accepted_strs}")
 
-        # Check stop condition BEFORE recording step
-        # The last accepted token is posterior[0, acceptance_length]
-        last_accepted_token = posterior[0, acceptance_length].item()
-        hit_stop_token = (stop_token_id == last_accepted_token)
+        # Check stop condition - look for stop token ANYWHERE in accepted sequence
+        # Not just at the end, since draft might predict <|cot_end|> mid-block
+        hit_stop_token = False
+        stop_position = None
+        for i, tok_id in enumerate(accepted_ids):
+            if tok_id == stop_token_id:
+                hit_stop_token = True
+                stop_position = i
+                break
+
+        # If stop token found mid-sequence, truncate acceptance
+        # Note: accepted_ids has acceptance_length + 2 elements (first_in_block + draft + posterior)
+        # But actual NEW tokens per step is acceptance_length + 1 (first_in_block was from previous step)
+        actual_acceptance = acceptance_length + 1  # default: all new tokens accepted
+        draft_matches = acceptance_length  # for acceptance rate calculation
+        if hit_stop_token and stop_position is not None:
+            # stop_position is index in accepted_ids array
+            # Index 0 = first_in_block (not new), indices 1+ = new tokens
+            # New tokens = stop_position (indices 1 through stop_position, not counting index 0)
+            actual_acceptance = stop_position
+            # Draft matches: if stop at index i, we accepted draft positions 1 through min(i, 7)
+            # (index 8 would be posterior, indices 1-7 are draft tokens)
+            draft_matches = min(stop_position, block_size - 1)
+            if stop_position < len(accepted_ids) - 1:
+                log(f"  [Stop token found at position {stop_position}, truncating acceptance]")
+                # Clear tokens after stop position
+                output_ids[:, start_pos + stop_position + 1:] = mask_token_id
+                # Update accepted_ids for logging
+                accepted_ids = accepted_ids[:stop_position + 1]
+                accepted_strs = accepted_strs[:stop_position + 1]
 
         # Record step info
         step_info = {
@@ -343,7 +411,8 @@ def run_dflash_inference_verbose(
             "draft_tokens": {"ids": draft_token_ids, "text": draft_token_strs},
             "target_tokens": {"ids": posterior_ids, "text": posterior_strs},
             "matches": match_list,
-            "acceptance_length": acceptance_length + 1,
+            "acceptance_length": actual_acceptance,
+            "draft_matches": draft_matches,  # for acceptance rate calculation
             "accepted_tokens": {"ids": accepted_ids, "text": accepted_strs},
         }
         steps.append(step_info)
@@ -351,46 +420,34 @@ def run_dflash_inference_verbose(
         # Stop immediately if we hit the stop token
         if hit_stop_token:
             log(f"\n  >>> STOP TOKEN (<|cot_end|>) accepted, stopping")
-            start_pos += acceptance_length + 1
+            start_pos += actual_acceptance
             break
 
         # Update position
         start_pos += acceptance_length + 1
 
-        # Update cache
+        # Update cache - crop to keep only valid positions
         past_key_values_target.crop(start_pos)
 
-        # Update target hidden - CRITICAL: use correction pass when rejection occurs
-        if acceptance_length == block_size - 1:
-            # Full match: hidden state from verify_output is correct
-            new_hidden = extract_context_feature(verify_output.hidden_states, target_layer_ids)
-            target_hidden = new_hidden[:, -1:, :]
-            log(f"  [Hidden: from verify_output, full match]")
-        else:
-            # Rejection: hidden state at acceptance_length is WRONG (computed under draft token)
-            # Must run correction pass on the actual accepted token
-            correction_token_id = output_ids[:, start_pos - 1 : start_pos]  # (B, 1)
-            correction_pos = start_pos - 1
+        # Extract hidden state for next iteration's context.
+        #
+        # Key insight: In verify_output, the hidden at index `acceptance_length` was computed
+        # using ONLY accepted tokens [known, draft_1, ..., draft_{acceptance_length}].
+        # Due to causal attention, this hidden state does NOT see the rejected draft tokens
+        # at later positions. Therefore, it's CORRECT and we can use it directly.
+        #
+        # - Full match (acceptance_length = block_size - 1): use hidden at index -1
+        # - Rejection (acceptance_length < block_size - 1): use hidden at index acceptance_length
+        # Both cases unify to: hidden at index acceptance_length
+        new_hidden = extract_context_feature(verify_output.hidden_states, target_layer_ids)
+        target_hidden = new_hidden[:, acceptance_length : acceptance_length + 1, :]
 
-            if rope_deltas is not None:
-                corr_pos_tensor = torch.tensor([correction_pos], device=device, dtype=torch.long)
-                corr_position_ids = corr_pos_tensor.view(1, 1, 1).expand(3, 1, 1).clone()
-                corr_position_ids = corr_position_ids + rope_deltas.unsqueeze(-1).to(dtype=torch.long, device=device)
-            else:
-                corr_position_ids = torch.tensor([[correction_pos]], device=device, dtype=torch.long)
-
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                correction_output = accelerator.target_vlm(
-                    input_ids=correction_token_id,
-                    position_ids=corr_position_ids,
-                    past_key_values=past_key_values_target,
-                    use_cache=True,
-                    output_hidden_states=True,
-                )
-
-            new_hidden = extract_context_feature(correction_output.hidden_states, target_layer_ids)
-            target_hidden = new_hidden[:, -1:, :]
-            log(f"  [Hidden: CORRECTION PASS for token '{model.tokenizer.decode([correction_token_id[0, 0].item()])}']")
+        # Debug: show hidden state statistics to diagnose feature quality
+        hidden_norm = target_hidden.norm().item()
+        hidden_mean = target_hidden.mean().item()
+        hidden_std = target_hidden.std().item()
+        log(f"  [Hidden: from verify_output at index {acceptance_length}, "
+            f"norm={hidden_norm:.2f}, mean={hidden_mean:.4f}, std={hidden_std:.4f}]")
 
         if step_num >= 50:  # Safety limit for verbose mode
             log(f"\n  >>> REACHED MAX STEPS (50)")
@@ -416,9 +473,11 @@ def run_dflash_inference_verbose(
     total_tokens = output_ids.shape[1] - num_input_tokens
     total_iterations = len(steps)
     acceptance_lengths = [s["acceptance_length"] for s in steps]
+    draft_matches_list = [s["draft_matches"] for s in steps]
+
     mean_acceptance = sum(acceptance_lengths) / len(acceptance_lengths) if acceptance_lengths else 0
     total_drafted = total_iterations * (block_size - 1)
-    total_accepted = sum(max(0, a - 1) for a in acceptance_lengths)
+    total_accepted = sum(draft_matches_list)
     acceptance_rate = total_accepted / total_drafted if total_drafted > 0 else 0
 
     log(f"Total tokens generated: {total_tokens}")
@@ -433,9 +492,22 @@ def run_dflash_inference_verbose(
         log(f"  Step {s['step']:2d}: accepted {s['acceptance_length']} tokens - "
             f"first='{s['first_token']['text']}' ({s['first_token']['id']})")
 
-    # Decode final output
+    # Decode final output - only show the CoT portion (not the full prompt)
     generated_text = model.tokenizer.decode(output_ids[0], skip_special_tokens=False)
-    log(f"\nGenerated text:\n{generated_text}")
+    # Extract just the CoT part for display
+    cot_start_marker = "<|cot_start|>"
+    cot_end_marker = "<|cot_end|>"
+    if cot_start_marker in generated_text:
+        cot_start_idx = generated_text.find(cot_start_marker)
+        cot_end_idx = generated_text.find(cot_end_marker)
+        if cot_end_idx > cot_start_idx:
+            cot_text = generated_text[cot_start_idx:cot_end_idx + len(cot_end_marker)]
+        else:
+            cot_text = generated_text[cot_start_idx:]
+        log(f"\nGenerated CoT:\n{cot_text}")
+    else:
+        # Fallback: show last 200 chars
+        log(f"\nGenerated text (last 200 chars):\n...{generated_text[-200:]}")
 
     return {
         "steps": steps,
