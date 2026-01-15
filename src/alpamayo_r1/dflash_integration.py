@@ -246,6 +246,11 @@ class GenerationStats:
     prefill_time_ms: float = 0.0
     decode_time_ms: float = 0.0
     block_size: int = 8  # Must match accelerator's block_size
+    # Detailed timing breakdown
+    draft_time_ms: float = 0.0      # Total time in draft model
+    verify_time_ms: float = 0.0     # Total time in target model verification
+    cache_time_ms: float = 0.0      # Total time in KV cache operations
+    sample_time_ms: float = 0.0     # Total time in token sampling
 
     @property
     def mean_acceptance_length(self) -> float:
@@ -567,6 +572,8 @@ class DFlashAlpamayoAccelerator:
         # After prefill, the KV cache contains num_input_tokens entries
         current_seq_len = num_input_tokens
 
+        # Synchronize to capture full prefill GPU time and prevent bleeding into decode
+        torch.cuda.synchronize()
         stats.prefill_time_ms = (time.perf_counter() - prefill_start) * 1000
 
         # ====== DECODE STAGE ======
@@ -618,6 +625,8 @@ class DFlashAlpamayoAccelerator:
 
             # 5. [CRITICAL] Disable KV cache
             # Since we operate in stateless mode with position reset, past_key_values are unnecessary and would cause incorrect behavior.
+            torch.cuda.synchronize()
+            draft_start = time.perf_counter()
             draft_hidden = self.draft_model(
                 target_hidden=current_context,      # (B, 1, H)
                 noise_embedding=noise_embedding,    # (B, block_size, H)
@@ -626,30 +635,43 @@ class DFlashAlpamayoAccelerator:
                 use_cache=False,                    # Do not return cache
                 is_causal=False,
             )
+            torch.cuda.synchronize()
+            stats.draft_time_ms += (time.perf_counter() - draft_start) * 1000
 
             # Get logits for drafted tokens (excluding first known token)
             # draft_hidden shape: (B, block_size, hidden_dim)
             draft_logits = self._lm_head(draft_hidden[:, 1:, :])
 
             # Sample draft tokens (apply logits processor to prevent trajectory tokens)
+            sample_start = time.perf_counter()
             block_output_ids[:, 1:] = sample_tokens(
                 draft_logits, temperature, self._logits_processor
             )
+            stats.sample_time_ms += (time.perf_counter() - sample_start) * 1000
 
             # Heuristic: if draft predicts <|cot_end|> without preceding ".", replace with "."
             # This fixes cases where draft skips "." and jumps to <|cot_end|>
             # The next step will then have first_in_block="." and directly append <|cot_end|>
+            # NOTE: Using tensor ops to avoid CPU-GPU sync that would prevent pipelining
             if stop_token_ids is not None:
-                draft_list = block_output_ids[0, 1:].tolist()
-                for i, tok in enumerate(draft_list):
-                    if tok in stop_token_ids:  # Found stop token (e.g., <|cot_end|>)
-                        prev_tok = block_output_ids[0, i].item()
-                        if prev_tok != period_token_id:
-                            # Replace <|cot_end|> with "." - next step will handle it
-                            block_output_ids[0, i + 1] = period_token_id
-                        break
+                stop_token = stop_token_ids[0]
+                draft_tokens = block_output_ids[0, 1:]  # (block_size-1,)
+                prev_tokens = block_output_ids[0, :-1]  # tokens before each draft position
+
+                # Find stop tokens where previous token is not period
+                is_stop = (draft_tokens == stop_token)
+                prev_not_period = (prev_tokens != period_token_id)
+
+                # Only fix first occurrence using cumsum trick
+                is_first_stop = is_stop & (is_stop.cumsum(0) == 1)
+                should_replace = is_first_stop & prev_not_period
+
+                # Replace stop token with period (GPU-only, no sync)
+                block_output_ids[0, 1:] = torch.where(should_replace, period_token_id, draft_tokens)
 
             # Verify: Run target model on the drafted block
+            torch.cuda.synchronize()
+            verify_start = time.perf_counter()
             verify_output = self.target_vlm(
                 input_ids=block_output_ids,
                 position_ids=block_position_ids,
@@ -657,11 +679,16 @@ class DFlashAlpamayoAccelerator:
                 use_cache=True,
                 output_hidden_states=True,
             )
+            torch.cuda.synchronize()
+            stats.verify_time_ms += (time.perf_counter() - verify_start) * 1000
 
             # Sample from target model's logits (apply logits processor)
+            sample_start2 = time.perf_counter()
             posterior = sample_tokens(
                 verify_output.logits, temperature, self._logits_processor
             )
+            torch.cuda.synchronize()
+            stats.sample_time_ms += (time.perf_counter() - sample_start2) * 1000
 
             # Compute acceptance: count consecutive matching tokens
             matches = block_output_ids[:, 1:] == posterior[:, :-1]
@@ -675,20 +702,24 @@ class DFlashAlpamayoAccelerator:
 
             # Check for stop tokens in the ENTIRE accepted sequence, not just the last token
             # This handles cases where <|cot_end|> appears mid-block
+            # NOTE: Using tensor ops to minimize CPU-GPU sync points
             hit_stop = False
             stop_position = None
             tokens_to_advance = acceptance_length + 1  # default: acceptance_length drafts + 1 posterior
             if stop_token_ids is not None:
-                accepted_tokens = output_ids[0, start : start + acceptance_length + 2].tolist()
-                for i, tok_id in enumerate(accepted_tokens):
-                    if tok_id in stop_token_ids:
-                        hit_stop = True
-                        stop_position = i
-                        tokens_to_advance = i  # stop at index i means we advance i positions (0 to i-1, then stop at i)
-                        # Clear tokens after stop token
-                        if i < len(accepted_tokens) - 1:
-                            output_ids[:, start + i + 1:] = self.mask_token_id
-                        break
+                accepted_tokens = output_ids[0, start : start + acceptance_length + 2]
+                stop_token = stop_token_ids[0]
+
+                # Find stop token using tensor ops (single sync at .any())
+                is_stop = (accepted_tokens == stop_token)
+                if is_stop.any():
+                    # Get first stop position
+                    stop_position = is_stop.nonzero(as_tuple=True)[0][0].item()
+                    hit_stop = True
+                    tokens_to_advance = stop_position
+                    # Clear tokens after stop token
+                    if stop_position < acceptance_length + 1:
+                        output_ids[:, start + stop_position + 1:] = self.mask_token_id
 
             # Update position and stats
             # tokens_to_advance already includes the +1 for posterior token
@@ -710,7 +741,10 @@ class DFlashAlpamayoAccelerator:
             # Update KV cache - crop to keep only valid positions
             # After acceptance, we have tokens at positions [0..start-1] where start is the NEW value
             # The cache should contain positions 0 to (start - 1), which is exactly what crop(start) does
+            cache_start = time.perf_counter()
             past_key_values_target.crop(start)
+            torch.cuda.synchronize()
+            stats.cache_time_ms += (time.perf_counter() - cache_start) * 1000
 
             # Extract hidden state for next iteration's context.
             #

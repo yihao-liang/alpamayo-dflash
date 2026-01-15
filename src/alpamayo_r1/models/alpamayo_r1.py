@@ -15,6 +15,7 @@
 
 import copy
 import logging
+import time
 from typing import Any
 
 import einops
@@ -67,6 +68,24 @@ class ExpertLogitsProcessor(LogitsProcessor):
         """
         # Directly assign -inf to the trajectory token positions in the scores tensor
         scores[:, self.traj_token_offset : self.traj_token_offset + self.traj_vocab_size] = float('-inf')
+        return scores
+
+
+class TimingLogitsProcessor(LogitsProcessor):
+    """LogitsProcessor that captures timing information during generation.
+
+    Records timestamps at the first call (end of prefill) and counts decode steps.
+    """
+
+    def __init__(self):
+        self.first_call_time = None
+        self.num_calls = 0
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        if self.first_call_time is None:
+            torch.cuda.synchronize()
+            self.first_call_time = time.perf_counter()
+        self.num_calls += 1
         return scores
 
 
@@ -181,14 +200,23 @@ class AlpamayoR1(ReasoningVLA):
         # because the KV cache is updated after the next token is generated
         eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
         stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
+
+        # Add timing processor to capture prefill/decode timing
+        timing_processor = TimingLogitsProcessor()
         logits_processor = LogitsProcessorList(
             [
+                timing_processor,
                 ExpertLogitsProcessor(
                     traj_token_offset=self.config.traj_token_start_idx,
                     traj_vocab_size=self.config.traj_vocab_size,
-                )
+                ),
             ]
         )
+
+        # Start total timing
+        torch.cuda.synchronize()
+        generate_start = time.perf_counter()
+
         vlm_outputs = self.vlm.generate(
             input_ids=input_ids,
             generation_config=generation_config,
@@ -196,7 +224,27 @@ class AlpamayoR1(ReasoningVLA):
             logits_processor=logits_processor,
             **tokenized_data,
         )
+
+        # End total timing
+        torch.cuda.synchronize()
+        generate_end = time.perf_counter()
+
+        # Calculate timing breakdown
+        total_time_ms = (generate_end - generate_start) * 1000
+        if timing_processor.first_call_time is not None:
+            prefill_time_ms = (timing_processor.first_call_time - generate_start) * 1000
+            decode_time_ms = (generate_end - timing_processor.first_call_time) * 1000
+        else:
+            prefill_time_ms = total_time_ms
+            decode_time_ms = 0.0
+
         vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
+        vlm_timing = {
+            "total_time_ms": total_time_ms,
+            "prefill_time_ms": prefill_time_ms,
+            "decode_time_ms": decode_time_ms,
+            "num_decode_steps": timing_processor.num_calls,
+        }
 
         # manually replace padding after EOS token
         vlm_outputs.sequences = replace_padding_after_eos(
@@ -288,6 +336,8 @@ class AlpamayoR1(ReasoningVLA):
         if diffusion_kwargs is None:
             diffusion_kwargs = {}
 
+        torch.cuda.synchronize()
+        diffusion_start = time.perf_counter()
         sampled_action = self.diffusion.sample(
             batch_size=total_batch,
             step_fn=step_fn,
@@ -295,6 +345,9 @@ class AlpamayoR1(ReasoningVLA):
             return_all_steps=False,
             **diffusion_kwargs,
         )
+        torch.cuda.synchronize()
+        diffusion_time_ms = (time.perf_counter() - diffusion_start) * 1000
+        vlm_timing["diffusion_time_ms"] = diffusion_time_ms
 
         # Repeat history to align with num_traj_samples
         hist_xyz_rep = einops.repeat(
@@ -324,6 +377,8 @@ class AlpamayoR1(ReasoningVLA):
                 extra[text_tokens] = np.array(extra[text_tokens]).reshape(
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
+            # Add timing information
+            extra["timing"] = vlm_timing
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 

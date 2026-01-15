@@ -55,11 +55,14 @@ def run_standard_inference(
     model_inputs: dict,
     temperature: float = 0.6,
     max_tokens: int = 256,
-) -> tuple[str, float, torch.Tensor, torch.Tensor]:
-    """Run standard autoregressive inference.
+) -> tuple[str, dict, torch.Tensor, torch.Tensor]:
+    """Run standard autoregressive inference with timing breakdown.
+
+    Note: This measures wall-clock time for the full pipeline (VLM + diffusion).
+    The internal timing breakdown (prefill/decode) is from vlm.generate() only.
 
     Returns:
-        Tuple of (coc_text, time_ms, pred_xyz, pred_rot).
+        Tuple of (coc_text, timing_dict, pred_xyz, pred_rot).
     """
     torch.cuda.synchronize()
     start = time.perf_counter()
@@ -75,11 +78,26 @@ def run_standard_inference(
         )
 
     torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - start) * 1000
+    total_time_ms = (time.perf_counter() - start) * 1000
 
     coc_text = extra["cot"][0, 0, 0] if extra["cot"].ndim == 3 else extra["cot"][0][0]
 
-    return coc_text, elapsed_ms, pred_xyz, pred_rot
+    # Get internal VLM timing breakdown
+    vlm_timing = extra.get("timing", {})
+    if not vlm_timing:
+        logger.warning("No timing info returned from model - using wall clock time only")
+
+    # Build timing dict with wall-clock total and VLM breakdown
+    timing = {
+        "total_time_ms": total_time_ms,  # Wall-clock: VLM + diffusion
+        "vlm_total_ms": vlm_timing.get("total_time_ms", 0),  # VLM generation only
+        "vlm_prefill_ms": vlm_timing.get("prefill_time_ms", 0),
+        "vlm_decode_ms": vlm_timing.get("decode_time_ms", 0),
+        "num_decode_steps": vlm_timing.get("num_decode_steps", 0),
+        "diffusion_time_ms": vlm_timing.get("diffusion_time_ms", 0),  # Trajectory diffusion
+    }
+
+    return coc_text, timing, pred_xyz, pred_rot
 
 
 def run_dflash_inference(
@@ -142,6 +160,12 @@ def run_dflash_inference(
         "acceptance_rate": stats.acceptance_rate,
         "prefill_time_ms": stats.prefill_time_ms,
         "decode_time_ms": stats.decode_time_ms,
+        "tokens_per_second": stats.total_tokens / (stats.decode_time_ms / 1000) if stats.decode_time_ms > 0 else 0,
+        # Detailed timing breakdown
+        "draft_time_ms": stats.draft_time_ms,
+        "verify_time_ms": stats.verify_time_ms,
+        "sample_time_ms": stats.sample_time_ms,
+        "cache_time_ms": stats.cache_time_ms,
     }
 
     return coc_text, elapsed_ms, stats_dict
@@ -214,6 +238,9 @@ def run_dflash_inference_verbose(
 
     # ====== PREFILL ======
     log(">>> PREFILL STAGE")
+    torch.cuda.synchronize()
+    prefill_start = time.perf_counter()
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
         prefill_output = accelerator.target_vlm(
             input_ids=input_ids,
@@ -223,6 +250,9 @@ def run_dflash_inference_verbose(
             use_cache=True,
             output_hidden_states=True,
         )
+
+    torch.cuda.synchronize()
+    prefill_time_ms = (time.perf_counter() - prefill_start) * 1000
 
     rope_deltas = getattr(accelerator.target_vlm.model, "rope_deltas", None)
     output_ids[:, :num_input_tokens] = input_ids
@@ -246,9 +276,13 @@ def run_dflash_inference_verbose(
     prefill_std = target_hidden.std().item()
     log(f"[Prefill context: norm={prefill_norm:.2f}, mean={prefill_mean:.4f}, std={prefill_std:.4f}]")
     log(f"Input length: {num_input_tokens}")
+    log(f"Prefill time: {prefill_time_ms:.1f} ms")
     log()
 
     # ====== DECODE LOOP ======
+    torch.cuda.synchronize()
+    decode_start = time.perf_counter()
+
     start_pos = num_input_tokens
     step_num = 0
 
@@ -453,6 +487,10 @@ def run_dflash_inference_verbose(
             log(f"\n  >>> REACHED MAX STEPS (50)")
             break
 
+    # End decode timing
+    torch.cuda.synchronize()
+    decode_time_ms = (time.perf_counter() - decode_start) * 1000
+
     log()
     log("=" * 80)
     log("SUMMARY")
@@ -479,9 +517,13 @@ def run_dflash_inference_verbose(
     total_drafted = total_iterations * (block_size - 1)
     total_accepted = sum(draft_matches_list)
     acceptance_rate = total_accepted / total_drafted if total_drafted > 0 else 0
+    tokens_per_second = total_tokens / (decode_time_ms / 1000) if decode_time_ms > 0 else 0
 
     log(f"Total tokens generated: {total_tokens}")
     log(f"Total iterations: {total_iterations}")
+    log(f"Prefill time: {prefill_time_ms:.1f} ms")
+    log(f"Decode time:  {decode_time_ms:.1f} ms")
+    log(f"Tokens/sec:   {tokens_per_second:.1f}")
     log(f"Mean acceptance length: {mean_acceptance:.2f}")
     log(f"Acceptance rate: {acceptance_rate:.1%}")
     log()
@@ -515,6 +557,9 @@ def run_dflash_inference_verbose(
         "total_iterations": total_iterations,
         "mean_acceptance_length": mean_acceptance,
         "acceptance_rate": acceptance_rate,
+        "prefill_time_ms": prefill_time_ms,
+        "decode_time_ms": decode_time_ms,
+        "tokens_per_second": tokens_per_second,
         "output_ids": output_ids,
         "generated_text": generated_text,
         "log": "\n".join(log_lines),
@@ -665,10 +710,23 @@ def main():
     # Collect results for all samples
     all_results = []
     dflash_times = []
+    prefill_times = []
+    decode_times = []
+    tokens_per_sec = []
+    # Detailed DFlash timing
+    draft_times = []
+    verify_times = []
+    sample_times = []
+    cache_times = []
+    # Standard timing
     standard_times = []
+    standard_prefill_times = []
+    standard_decode_times = []
+    standard_tokens_per_sec = []
     acceptance_rates = []
     acceptance_lengths = []
     speedups = []
+    decode_speedups = []
 
     for i, clip_id in enumerate(clip_ids):
         logger.info(f"\n{'='*60}")
@@ -706,10 +764,25 @@ def main():
                 import copy
                 standard_inputs = copy.deepcopy(model_inputs)
 
-                coc_standard, time_standard, pred_xyz, _ = run_standard_inference(
+                # Run standard inference with timing breakdown
+                # Note: total_time_ms = wall clock (VLM + diffusion)
+                #       vlm_* times = VLM generation only (for fair comparison)
+                coc_standard, timing, pred_xyz, _ = run_standard_inference(
                     model, standard_inputs, temperature=0.6, max_tokens=args.max_tokens
                 )
-                standard_times.append(time_standard)
+
+                time_standard = timing.get("total_time_ms", 0)  # Wall clock (includes diffusion)
+                vlm_total_ms = timing.get("vlm_total_ms", 0)    # VLM only (for comparison)
+                vlm_prefill_ms = timing.get("vlm_prefill_ms", 0)
+                vlm_decode_ms = timing.get("vlm_decode_ms", 0)
+                diffusion_ms = timing.get("diffusion_time_ms", 0)
+                num_tokens = timing.get("num_decode_steps", 0)
+                tps = num_tokens / (vlm_decode_ms / 1000) if vlm_decode_ms > 0 else 0
+
+                standard_times.append(vlm_total_ms)  # Use VLM-only time for fair comparison
+                standard_prefill_times.append(vlm_prefill_ms)
+                standard_decode_times.append(vlm_decode_ms)
+                standard_tokens_per_sec.append(tps)
 
                 # Compute minADE
                 gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
@@ -718,10 +791,17 @@ def main():
                 min_ade = float(diff.min())
 
                 sample_result["standard"] = {
-                    "time_ms": time_standard,
+                    "time_ms": time_standard,  # Wall clock (VLM + diffusion)
+                    "vlm_total_ms": vlm_total_ms,
+                    "vlm_prefill_ms": vlm_prefill_ms,
+                    "vlm_decode_ms": vlm_decode_ms,
+                    "diffusion_ms": diffusion_ms,
+                    "tokens_per_second": tps,
+                    "total_tokens": num_tokens,
                     "min_ade": min_ade,
                 }
-                logger.info(f"  Standard: {time_standard:.1f}ms, minADE={min_ade:.3f}m")
+                logger.info(f"  Standard: {vlm_total_ms:.1f}ms VLM (prefill={vlm_prefill_ms:.1f}ms, decode={vlm_decode_ms:.1f}ms) + {diffusion_ms:.1f}ms diffusion")
+                logger.info(f"            tokens={num_tokens}, tok/s={tps:.1f}, minADE={min_ade:.3f}m")
 
             # Run DFlash inference
             torch.cuda.manual_seed_all(42)
@@ -744,6 +824,9 @@ def main():
                     "total_iterations": verbose_result["total_iterations"],
                     "mean_acceptance_length": verbose_result["mean_acceptance_length"],
                     "acceptance_rate": verbose_result["acceptance_rate"],
+                    "prefill_time_ms": verbose_result["prefill_time_ms"],
+                    "decode_time_ms": verbose_result["decode_time_ms"],
+                    "tokens_per_second": verbose_result["tokens_per_second"],
                 }
                 sample_result["verbose_log"] = verbose_result["log"]
             else:
@@ -755,22 +838,54 @@ def main():
             dflash_times.append(time_dflash)
             acceptance_rates.append(stats["acceptance_rate"])
             acceptance_lengths.append(stats["mean_acceptance_length"])
+            if "prefill_time_ms" in stats:
+                prefill_times.append(stats["prefill_time_ms"])
+                decode_times.append(stats["decode_time_ms"])
+                tokens_per_sec.append(stats.get("tokens_per_second", 0))
+            # Collect detailed timing
+            if "draft_time_ms" in stats:
+                draft_times.append(stats["draft_time_ms"])
+                verify_times.append(stats["verify_time_ms"])
+                sample_times.append(stats["sample_time_ms"])
+                cache_times.append(stats["cache_time_ms"])
 
             sample_result["dflash"] = {
                 "time_ms": time_dflash,
                 "total_tokens": stats["total_tokens"],
                 "acceptance_rate": stats["acceptance_rate"],
                 "mean_acceptance_length": stats["mean_acceptance_length"],
+                "prefill_time_ms": stats.get("prefill_time_ms", 0),
+                "decode_time_ms": stats.get("decode_time_ms", 0),
+                "tokens_per_second": stats.get("tokens_per_second", 0),
             }
 
             if not args.verbose:
-                logger.info(f"  DFlash:   {time_dflash:.1f}ms, accept_rate={stats['acceptance_rate']:.1%}, accept_len={stats['mean_acceptance_length']:.2f}")
+                logger.info(f"  DFlash:   {time_dflash:.1f}ms (prefill={stats.get('prefill_time_ms', 0):.1f}ms, decode={stats.get('decode_time_ms', 0):.1f}ms)")
+                logger.info(f"            accept_rate={stats['acceptance_rate']:.1%}, accept_len={stats['mean_acceptance_length']:.2f}, tok/s={stats.get('tokens_per_second', 0):.1f}")
+                # Detailed decode breakdown
+                draft_ms = stats.get('draft_time_ms', 0)
+                verify_ms = stats.get('verify_time_ms', 0)
+                sample_ms = stats.get('sample_time_ms', 0)
+                cache_ms = stats.get('cache_time_ms', 0)
+                logger.info(f"            decode breakdown: draft={draft_ms:.1f}ms, verify={verify_ms:.1f}ms, sample={sample_ms:.1f}ms, cache={cache_ms:.1f}ms")
 
             if args.compare:
-                speedup = time_standard / time_dflash if time_dflash > 0 else 0
+                # Compare VLM-only times (fair comparison - both doing CoC generation)
+                vlm_total = sample_result["standard"].get("vlm_total_ms", 0)
+                speedup = vlm_total / time_dflash if time_dflash > 0 else 0
                 speedups.append(speedup)
+                # Compute decode-only speedup (more meaningful for speculative decoding)
+                dflash_decode = stats.get("decode_time_ms", 0)
+                standard_decode = sample_result["standard"].get("vlm_decode_ms", 0)
+                if dflash_decode > 0 and standard_decode > 0:
+                    decode_speedup = standard_decode / dflash_decode
+                else:
+                    decode_speedup = float('nan')
+                    logger.warning(f"  Cannot compute decode speedup: standard_decode={standard_decode}, dflash_decode={dflash_decode}")
+                decode_speedups.append(decode_speedup)
                 sample_result["speedup"] = speedup
-                logger.info(f"  Speedup:  {speedup:.2f}x")
+                sample_result["decode_speedup"] = decode_speedup
+                logger.info(f"  Speedup:  {speedup:.2f}x (VLM only), {decode_speedup:.2f}x (decode only)")
 
             all_results.append(sample_result)
 
@@ -792,16 +907,49 @@ def main():
         avg_acceptance_length = np.mean(acceptance_lengths)
 
         logger.info(f"\nDFlash Metrics:")
-        logger.info(f"  Avg time:              {avg_dflash_time:.1f} ms")
+        logger.info(f"  Avg total time:        {avg_dflash_time:.1f} ms")
+        if prefill_times:
+            avg_prefill = np.mean(prefill_times)
+            avg_decode = np.mean(decode_times)
+            avg_tps = np.mean(tokens_per_sec)
+            logger.info(f"  Avg prefill time:      {avg_prefill:.1f} ms")
+            logger.info(f"  Avg decode time:       {avg_decode:.1f} ms")
+            logger.info(f"  Avg tokens/sec:        {avg_tps:.1f}")
+        # Detailed decode breakdown
+        if draft_times:
+            avg_draft = np.mean(draft_times)
+            avg_verify = np.mean(verify_times)
+            avg_sample = np.mean(sample_times)
+            avg_cache = np.mean(cache_times)
+            logger.info(f"  Decode breakdown:")
+            logger.info(f"    - Draft model:       {avg_draft:.1f} ms ({100*avg_draft/avg_decode:.1f}%)")
+            logger.info(f"    - Target verify:     {avg_verify:.1f} ms ({100*avg_verify/avg_decode:.1f}%)")
+            logger.info(f"    - Token sampling:    {avg_sample:.1f} ms ({100*avg_sample/avg_decode:.1f}%)")
+            logger.info(f"    - KV cache ops:      {avg_cache:.1f} ms ({100*avg_cache/avg_decode:.1f}%)")
+            other_time = avg_decode - avg_draft - avg_verify - avg_sample - avg_cache
+            logger.info(f"    - Other overhead:    {other_time:.1f} ms ({100*other_time/avg_decode:.1f}%)")
         logger.info(f"  Avg acceptance rate:   {avg_acceptance_rate:.1%}")
         logger.info(f"  Avg acceptance length: {avg_acceptance_length:.2f}")
 
         if args.compare and len(standard_times) > 0:
-            avg_standard_time = np.mean(standard_times)
+            avg_standard_time = np.mean(standard_times)  # Wall clock (VLM + diffusion)
+            avg_standard_prefill = np.mean(standard_prefill_times)  # VLM prefill only
+            avg_standard_decode = np.mean(standard_decode_times)    # VLM decode only
+            avg_standard_tps = np.mean(standard_tokens_per_sec)
             avg_speedup = np.mean(speedups)
-            logger.info(f"\nComparison:")
-            logger.info(f"  Avg standard time:     {avg_standard_time:.1f} ms")
-            logger.info(f"  Avg speedup:           {avg_speedup:.2f}x")
+            # Filter out NaN values for decode speedup
+            valid_decode_speedups = [s for s in decode_speedups if not np.isnan(s)]
+            avg_decode_speedup = np.mean(valid_decode_speedups) if valid_decode_speedups else float('nan')
+
+            logger.info(f"\nStandard (autoregressive) - VLM generation only:")
+            logger.info(f"  Avg VLM total:         {avg_standard_time:.1f} ms")
+            logger.info(f"  Avg VLM prefill:       {avg_standard_prefill:.1f} ms")
+            logger.info(f"  Avg VLM decode:        {avg_standard_decode:.1f} ms")
+            logger.info(f"  Avg tokens/sec:        {avg_standard_tps:.1f}")
+
+            logger.info(f"\nSpeedup (CoC generation only):")
+            logger.info(f"  VLM total speedup:     {avg_speedup:.2f}x")
+            logger.info(f"  VLM decode speedup:    {avg_decode_speedup:.2f}x  <-- speculative decoding benefit")
 
     # Build final results dict
     results = {
@@ -816,6 +964,9 @@ def main():
         },
         "aggregate": {
             "avg_dflash_time_ms": float(np.mean(dflash_times)) if dflash_times else 0,
+            "avg_prefill_time_ms": float(np.mean(prefill_times)) if prefill_times else 0,
+            "avg_decode_time_ms": float(np.mean(decode_times)) if decode_times else 0,
+            "avg_tokens_per_second": float(np.mean(tokens_per_sec)) if tokens_per_sec else 0,
             "avg_acceptance_rate": float(np.mean(acceptance_rates)) if acceptance_rates else 0,
             "avg_acceptance_length": float(np.mean(acceptance_lengths)) if acceptance_lengths else 0,
         },
@@ -824,7 +975,11 @@ def main():
 
     if args.compare and standard_times:
         results["aggregate"]["avg_standard_time_ms"] = float(np.mean(standard_times))
+        results["aggregate"]["avg_standard_prefill_ms"] = float(np.mean(standard_prefill_times))
+        results["aggregate"]["avg_standard_decode_ms"] = float(np.mean(standard_decode_times))
+        results["aggregate"]["avg_standard_tokens_per_sec"] = float(np.mean(standard_tokens_per_sec))
         results["aggregate"]["avg_speedup"] = float(np.mean(speedups))
+        results["aggregate"]["avg_decode_speedup"] = float(np.mean(decode_speedups))
 
     # Save results
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
