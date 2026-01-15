@@ -7,7 +7,7 @@ This allows fast training with KL loss without loading Alpamayo during training.
 Usage:
     python generate_distillation_data.py \
         --cache-dir /data/physicalai_av/hf_cache \
-        --output-dir /data/dflash_distillation \
+        --output-dir /data/dflash_train \
         --num-chunks 400 \
         --stride 1 \
         --top-k-logits 128
@@ -307,7 +307,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/data/dflash_distillation",
+        default="/data/dflash_train",
         help="Output directory for distillation data",
     )
     parser.add_argument(

@@ -16,11 +16,27 @@ Trying to speed up Alpamayo's Chain-of-Causation text generation using DFlash bl
 - Training data: chunks 0-399 `stride=1`
 
 **Held-out evaluation (chunks 400-401, 10 clips):**
-| Metric | Value |
-|--------|-------|
+
+| Metric | DFlash | Standard | Speedup |
+|--------|--------|----------|---------|
+| **Total time** | 941.6 ms | 1569.5 ms | 1.69x |
+| **Prefill time** | 788.7 ms | 877.7 ms | - |
+| **Decode time** | 149.9 ms | 691.8 ms | **5.77x** |
+| **Tokens/sec** | 111.7 | 22.2 | 5.0x |
+
+| Speculative Decoding Metrics | Value |
+|------------------------------|-------|
 | Avg acceptance rate | **75.8%** |
 | Avg acceptance length | **6.25** |
-| Avg speedup | 2.18x (952.3 ms vs 2066.4 ms)|
+
+**Decode breakdown (DFlash):**
+| Component | Time | % of decode |
+|-----------|------|-------------|
+| Draft model | 16.5 ms | 11.0% |
+| Target verify | 127.8 ms | 85.3% |
+| Token sampling | 0.5 ms | 0.3% |
+| KV cache ops | 0.3 ms | 0.2% |
+| Other overhead | 4.9 ms | 3.3% |
 
 ## Layer Selection
 
@@ -99,7 +115,7 @@ Or manually:
 ```bash
 torchrun --nproc_per_node=8 dflash/train_dflash.py \
     --target-model /models/Alpamayo-R1-10B \
-    --data-dir /data/dflash_distillation \
+    --data-dir /data/dflash_train \
     --output-dir /exp \
     --num-epochs 5 \
     --batch-size 64 \
@@ -115,7 +131,7 @@ Key features:
 ### Step 3 (alt): Distillation from pre-trained DFlash
 ```bash
 torchrun --nproc_per_node=8 dflash/distill_dflash.py \
-      --data-dir /data/dflash_distillation \
+      --data-dir /data/dflash_train \
       --loss-type ce+kl \
       --full-vocab \
       --learning-rate 1e-5
@@ -125,7 +141,7 @@ torchrun --nproc_per_node=8 dflash/distill_dflash.py \
 Debug (verbose)
 ```bash
 python src/alpamayo_r1/test_dflash_inference.py \
-      --draft-model /exp/dflash_0114_200248/best \
+      --draft-model /exp/dflash_train_0115_163242/best \
       --clip-ids /data/physicalai_av/clip_ids_400_401.json \
       --num-samples 10 \
       --max-tokens 64 \
@@ -136,13 +152,27 @@ python src/alpamayo_r1/test_dflash_inference.py \
 Compare
 ```bash
 python src/alpamayo_r1/test_dflash_inference.py \
-      --draft-model /exp/dflash_0114_200248/best \
+      --draft-model /exp/dflash_train_0115_163242/best \
       --clip-ids /data/physicalai_av/clip_ids_400_401.json \
       --num-samples 10 \
       --max-tokens 64 \
       --temperature 0 \
       --compare
 ```
+
+Compare with detailed timing breakdown (draft/verify/sample/cache)
+```bash
+python src/alpamayo_r1/test_dflash_inference.py \
+      --draft-model /exp/dflash_train_0115_163242/best \
+      --clip-ids /data/physicalai_av/clip_ids_400_401.json \
+      --num-samples 10 \
+      --max-tokens 64 \
+      --temperature 0 \
+      --compare \
+      --detailed-timing
+```
+
+Note: `--detailed-timing` uses CUDA events to measure where decode time is spent. Adds slight overhead, so omit for production benchmarks.
 
 ## Issues
 

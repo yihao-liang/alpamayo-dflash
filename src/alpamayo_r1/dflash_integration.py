@@ -93,13 +93,20 @@ def sample_tokens(
     bsz, seq_len, vocab_size = logits.shape
 
     # Apply logits processor if provided (e.g., to mask trajectory tokens)
+    # Vectorized: apply mask directly to 3D tensor instead of looping per position
     if logits_processor is not None:
-        # Process each position independently (processor expects 2D input)
-        processed_logits = []
-        for pos in range(seq_len):
-            pos_logits = logits_processor(None, logits[:, pos, :])
-            processed_logits.append(pos_logits)
-        logits = torch.stack(processed_logits, dim=1)
+        if isinstance(logits_processor, _TrajectoryTokenMask):
+            # Optimized path: apply mask to all positions at once
+            offset = logits_processor.traj_token_offset
+            size = logits_processor.traj_vocab_size
+            logits[:, :, offset : offset + size] = float("-inf")
+        else:
+            # Fallback: loop for custom processors (preserves compatibility)
+            processed_logits = []
+            for pos in range(seq_len):
+                pos_logits = logits_processor(None, logits[:, pos, :])
+                processed_logits.append(pos_logits)
+            logits = torch.stack(processed_logits, dim=1)
 
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
@@ -343,6 +350,11 @@ class DFlashAlpamayoAccelerator:
                 f"offset={self.config.traj_token_offset}, vocab_size={self.config.traj_vocab_size}"
             )
 
+        # Setup hooks for efficient hidden state capture (avoids storing all layers)
+        self._captured_hidden_states: dict[int, torch.Tensor] = {}
+        self._hooks: list = []
+        self._setup_hidden_state_hooks()
+
         logger.info(
             f"DFlash accelerator initialized: block_size={self.block_size}, "
             f"target_layers={self.target_layer_ids}, mask_token_id={self.mask_token_id}"
@@ -448,6 +460,44 @@ class DFlashAlpamayoAccelerator:
             "For best results, use the exact mask token from DFlash training."
         )
 
+    def _setup_hidden_state_hooks(self) -> None:
+        """Register forward hooks to capture hidden states from specific layers only.
+
+        This avoids storing all layer hidden states (output_hidden_states=True),
+        which causes significant memory allocation overhead.
+        """
+        def make_hook(layer_id: int):
+            def hook_fn(module, input, output):
+                # output is typically (hidden_states, ...) or just hidden_states
+                if isinstance(output, tuple):
+                    self._captured_hidden_states[layer_id] = output[0]
+                else:
+                    self._captured_hidden_states[layer_id] = output
+            return hook_fn
+
+        # Register hooks on the specific layers we need
+        # Qwen3VL structure: target_vlm.model.language_model.layers[i]
+        language_model = self.target_vlm.model.language_model
+        for layer_id in self.target_layer_ids:
+            layer = language_model.layers[layer_id]
+            hook = layer.register_forward_hook(make_hook(layer_id))
+            self._hooks.append(hook)
+
+        logger.info(f"[DFlash] Registered hooks on {len(self.target_layer_ids)} layers for efficient hidden state capture")
+
+    def _extract_hooked_hidden_states(self) -> torch.Tensor:
+        """Extract and concatenate hidden states captured by hooks.
+
+        Returns:
+            Concatenated hidden states tensor of shape (batch, seq_len, hidden_size * num_layers).
+        """
+        selected_states = [self._captured_hidden_states[layer_id] for layer_id in self.target_layer_ids]
+        return torch.cat(selected_states, dim=-1)
+
+    def _clear_captured_states(self) -> None:
+        """Clear captured hidden states before next forward pass."""
+        self._captured_hidden_states.clear()
+
     @torch.inference_mode()
     def generate(
         self,
@@ -459,6 +509,7 @@ class DFlashAlpamayoAccelerator:
         temperature: float | None = None,
         position_ids: torch.Tensor | None = None,
         rope_deltas: torch.Tensor | None = None,
+        enable_detailed_timing: bool = False,
         **prefill_kwargs,
     ) -> tuple[torch.Tensor, GenerationStats]:
         """Generate text using speculative decoding with DFlash.
@@ -477,6 +528,8 @@ class DFlashAlpamayoAccelerator:
             position_ids: Optional 3D position IDs for MROPE (shape: 3, batch, seq_len).
                 If not provided, will be computed during prefill.
             rope_deltas: Optional rope deltas from previous processing.
+            enable_detailed_timing: If True, measure detailed timing breakdown using
+                CUDA events. When False (default), skip timing for maximum speed.
             **prefill_kwargs: Additional kwargs for prefill.
 
         Returns:
@@ -522,7 +575,9 @@ class DFlashAlpamayoAccelerator:
         # NOTE: For Qwen2-VL/Qwen3-VL with MROPE, we let the model compute position_ids internally
         # during prefill when pixel_values are provided. The model's internal logic handles
         # the 3D positional encoding for image tokens correctly.
+        # Using hooks to capture only needed layers (avoids storing all layers)
         prefill_kwargs_internal = dict(prefill_kwargs)
+        self._clear_captured_states()
         if pixel_values is not None:
             # Let the VLM compute MROPE position_ids internally for multimodal inputs
             prefill_output = self.target_vlm(
@@ -531,7 +586,7 @@ class DFlashAlpamayoAccelerator:
                 image_grid_thw=image_grid_thw,
                 past_key_values=past_key_values_target,
                 use_cache=True,
-                output_hidden_states=True,
+                output_hidden_states=False,  # Using hooks instead
                 **prefill_kwargs_internal,
             )
             # Capture rope_deltas for continuation (Qwen2-VL/Qwen3-VL stores this)
@@ -544,7 +599,7 @@ class DFlashAlpamayoAccelerator:
                 position_ids=simple_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
-                output_hidden_states=True,
+                output_hidden_states=False,  # Using hooks instead
                 **prefill_kwargs_internal,
             )
             rope_deltas = None
@@ -558,13 +613,11 @@ class DFlashAlpamayoAccelerator:
             first_token_logits, temperature, self._logits_processor
         )
 
-        # Extract context features for draft model
+        # Extract context features for draft model (from hooks, not full hidden states)
         # In stateless mode, we only keep the LAST hidden state from prefill.
         # This hidden state has already attended to all image and prompt features
         # through Alpamayo's self-attention, so it contains compressed context.
-        full_hidden = extract_context_feature(
-            prefill_output.hidden_states, self.target_layer_ids
-        )
+        full_hidden = self._extract_hooked_hidden_states()
         # Keep only the last position (the first generated token's context)
         target_hidden = full_hidden[:, -1:, :]  # (B, 1, hidden_dim)
 
@@ -581,6 +634,25 @@ class DFlashAlpamayoAccelerator:
         start = num_input_tokens
         period_token_id = 13  # "." token for heuristics
 
+        # Precompute tensors that are constant across iterations (avoid per-iteration allocations)
+        # Draft model always uses relative positions 0..block_size
+        reset_position_ids = torch.arange(
+            0, 1 + block_size, device=device
+        ).unsqueeze(0).expand(bsz, -1)
+        # Base positions for target model (will add `start` offset each iteration)
+        base_block_positions = torch.arange(0, block_size, device=device, dtype=torch.long)
+        # Precompute rope_deltas tensor if needed
+        if rope_deltas is not None:
+            rope_deltas_long = rope_deltas.to(dtype=torch.long, device=device)
+
+        # CUDA events for detailed timing (only created if needed)
+        # Events allow measuring GPU time without blocking CPU-GPU overlap
+        if enable_detailed_timing:
+            draft_events = []  # List of (start_event, end_event) tuples
+            verify_events = []
+            sample_events = []
+            cache_events = []
+
         while start < max_length:
             # 1. Prepare the block (first token is known, rest are masks)
             block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -596,25 +668,16 @@ class DFlashAlpamayoAccelerator:
                 break
 
             # Compute position IDs for TARGET MODEL verification (uses absolute positions)
-            # For MROPE (Qwen2-VL/Qwen3-VL), position_ids should be 3D: (3, batch, seq_len)
-            block_positions = torch.arange(
-                start, start + block_size, device=device, dtype=torch.long
-            )
+            # Use precomputed base + offset to avoid per-iteration tensor allocation
+            block_positions = base_block_positions + start
             if rope_deltas is not None:
                 # MROPE: Create 3D position IDs, applying rope_deltas offset
-                block_position_ids = block_positions.view(1, 1, -1).expand(3, bsz, -1).clone()
-                block_position_ids = block_position_ids + rope_deltas.unsqueeze(-1).to(
-                    dtype=torch.long, device=device
-                )
+                block_position_ids = block_positions.view(1, 1, -1).expand(3, bsz, -1) + rope_deltas_long.unsqueeze(-1)
             else:
                 # Standard 1D position IDs
                 block_position_ids = block_positions.unsqueeze(0).expand(bsz, -1)
 
-            # 2. Position reset for DRAFT model (Relative Positioning)
-            # During training, DFlash always sees positions 0..ctx_len+block_size. Inference must strictly match this behavior to avoid distribution shift. ctx_len=1 (single hidden state context) + block_size tokens
-            reset_position_ids = torch.arange(
-                0, 1 + block_size, device=device
-            ).unsqueeze(0).expand(bsz, -1)
+            # Note: reset_position_ids for draft model is precomputed outside loop (constant 0..block_size)
 
             # 3. Embedding
             noise_embedding = self._embed_tokens(block_output_ids)
@@ -625,8 +688,11 @@ class DFlashAlpamayoAccelerator:
 
             # 5. [CRITICAL] Disable KV cache
             # Since we operate in stateless mode with position reset, past_key_values are unnecessary and would cause incorrect behavior.
-            torch.cuda.synchronize()
-            draft_start = time.perf_counter()
+            if enable_detailed_timing:
+                draft_start_event = torch.cuda.Event(enable_timing=True)
+                draft_end_event = torch.cuda.Event(enable_timing=True)
+                draft_start_event.record()
+
             draft_hidden = self.draft_model(
                 target_hidden=current_context,      # (B, 1, H)
                 noise_embedding=noise_embedding,    # (B, block_size, H)
@@ -635,19 +701,28 @@ class DFlashAlpamayoAccelerator:
                 use_cache=False,                    # Do not return cache
                 is_causal=False,
             )
-            torch.cuda.synchronize()
-            stats.draft_time_ms += (time.perf_counter() - draft_start) * 1000
+
+            if enable_detailed_timing:
+                draft_end_event.record()
+                draft_events.append((draft_start_event, draft_end_event))
 
             # Get logits for drafted tokens (excluding first known token)
             # draft_hidden shape: (B, block_size, hidden_dim)
             draft_logits = self._lm_head(draft_hidden[:, 1:, :])
 
             # Sample draft tokens (apply logits processor to prevent trajectory tokens)
-            sample_start = time.perf_counter()
+            if enable_detailed_timing:
+                sample_start_event = torch.cuda.Event(enable_timing=True)
+                sample_end_event = torch.cuda.Event(enable_timing=True)
+                sample_start_event.record()
+
             block_output_ids[:, 1:] = sample_tokens(
                 draft_logits, temperature, self._logits_processor
             )
-            stats.sample_time_ms += (time.perf_counter() - sample_start) * 1000
+
+            if enable_detailed_timing:
+                sample_end_event.record()
+                sample_events.append((sample_start_event, sample_end_event))
 
             # Heuristic: if draft predicts <|cot_end|> without preceding ".", replace with "."
             # This fixes cases where draft skips "." and jumps to <|cot_end|>
@@ -670,25 +745,38 @@ class DFlashAlpamayoAccelerator:
                 block_output_ids[0, 1:] = torch.where(should_replace, period_token_id, draft_tokens)
 
             # Verify: Run target model on the drafted block
-            torch.cuda.synchronize()
-            verify_start = time.perf_counter()
+            # Using hooks to capture only needed layers (avoids storing all layers)
+            self._clear_captured_states()
+            if enable_detailed_timing:
+                verify_start_event = torch.cuda.Event(enable_timing=True)
+                verify_end_event = torch.cuda.Event(enable_timing=True)
+                verify_start_event.record()
+
             verify_output = self.target_vlm(
                 input_ids=block_output_ids,
                 position_ids=block_position_ids,
                 past_key_values=past_key_values_target,
                 use_cache=True,
-                output_hidden_states=True,
+                output_hidden_states=False,  # Using hooks instead
             )
-            torch.cuda.synchronize()
-            stats.verify_time_ms += (time.perf_counter() - verify_start) * 1000
+
+            if enable_detailed_timing:
+                verify_end_event.record()
+                verify_events.append((verify_start_event, verify_end_event))
 
             # Sample from target model's logits (apply logits processor)
-            sample_start2 = time.perf_counter()
+            if enable_detailed_timing:
+                sample2_start_event = torch.cuda.Event(enable_timing=True)
+                sample2_end_event = torch.cuda.Event(enable_timing=True)
+                sample2_start_event.record()
+
             posterior = sample_tokens(
                 verify_output.logits, temperature, self._logits_processor
             )
-            torch.cuda.synchronize()
-            stats.sample_time_ms += (time.perf_counter() - sample_start2) * 1000
+
+            if enable_detailed_timing:
+                sample2_end_event.record()
+                sample_events.append((sample2_start_event, sample2_end_event))
 
             # Compute acceptance: count consecutive matching tokens
             matches = block_output_ids[:, 1:] == posterior[:, :-1]
@@ -739,12 +827,19 @@ class DFlashAlpamayoAccelerator:
                 break
 
             # Update KV cache - crop to keep only valid positions
-            # After acceptance, we have tokens at positions [0..start-1] where start is the NEW value
-            # The cache should contain positions 0 to (start - 1), which is exactly what crop(start) does
-            cache_start = time.perf_counter()
-            past_key_values_target.crop(start)
-            torch.cuda.synchronize()
-            stats.cache_time_ms += (time.perf_counter() - cache_start) * 1000
+            # Only needed when there's a rejection (acceptance_length < block_size - 1)
+            # When fully accepted, the cache already has the correct length
+            if acceptance_length < block_size - 1:
+                if enable_detailed_timing:
+                    cache_start_event = torch.cuda.Event(enable_timing=True)
+                    cache_end_event = torch.cuda.Event(enable_timing=True)
+                    cache_start_event.record()
+
+                past_key_values_target.crop(start)
+
+                if enable_detailed_timing:
+                    cache_end_event.record()
+                    cache_events.append((cache_start_event, cache_end_event))
 
             # Extract hidden state for next iteration's context.
             #
@@ -756,10 +851,20 @@ class DFlashAlpamayoAccelerator:
             # - Full match (acceptance_length = block_size - 1): use hidden at index -1
             # - Rejection (acceptance_length < block_size - 1): use hidden at index acceptance_length
             # Both cases unify to: hidden at index acceptance_length
-            new_hidden = extract_context_feature(
-                verify_output.hidden_states, self.target_layer_ids
-            )
+            new_hidden = self._extract_hooked_hidden_states()
             target_hidden = new_hidden[:, acceptance_length : acceptance_length + 1, :]
+
+        # Compute detailed timing from CUDA events (single sync point at end)
+        if enable_detailed_timing:
+            torch.cuda.synchronize()  # Wait for all GPU ops to complete
+            for start_evt, end_evt in draft_events:
+                stats.draft_time_ms += start_evt.elapsed_time(end_evt)
+            for start_evt, end_evt in verify_events:
+                stats.verify_time_ms += start_evt.elapsed_time(end_evt)
+            for start_evt, end_evt in sample_events:
+                stats.sample_time_ms += start_evt.elapsed_time(end_evt)
+            for start_evt, end_evt in cache_events:
+                stats.cache_time_ms += start_evt.elapsed_time(end_evt)
 
         stats.decode_time_ms = (time.perf_counter() - decode_start) * 1000
 

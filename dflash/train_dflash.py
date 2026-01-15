@@ -14,13 +14,13 @@ Usage:
     # Train from scratch with frozen embeddings (recommended)
     torchrun --nproc_per_node=8 train_dflash_scratch.py \
         --target-model /models/Alpamayo-R1-10B \
-        --data-dir /data/dflash_distillation \
+        --data-dir /data/dflash_train \
         --output-dir /exp/dflash_scratch
 
     # Train with trainable embeddings
     torchrun --nproc_per_node=8 train_dflash_scratch.py \
         --target-model /models/Alpamayo-R1-10B \
-        --data-dir /data/dflash_distillation \
+        --data-dir /data/dflash_train \
         --output-dir /exp/dflash_scratch \
         --train-embeddings
 """
@@ -795,7 +795,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train DFlash from scratch for Alpamayo")
     parser.add_argument("--target-model", type=str, default="/models/Alpamayo-R1-10B",
                         help="Path to Alpamayo target model")
-    parser.add_argument("--data-dir", type=str, default="/data/dflash_distillation",
+    parser.add_argument("--data-dir", type=str, default="/data/dflash_train",
                         help="Directory containing distillation data")
     parser.add_argument("--output-dir", type=str, default="/exp",
                         help="Base output directory")

@@ -14,7 +14,7 @@ Options:
                       Step N: Draft tokens [id1, id2, ...] = ['tok1', 'tok2', ...]
                               Target tokens [id1, id2, ...] = ['tok1', 'tok2', ...]
                               Accepted: M tokens
-    --draft-model   Path to DFlash draft model (default: /models/Qwen3-8B-DFlash-b16)
+    --draft-model   Path to DFlash draft model (default: /exp/dflash_train_0115_163242/best)
     --output-dir    Directory to save experiment results (default: /exp)
 
 Example:
@@ -106,11 +106,17 @@ def run_dflash_inference(
     tokenized_data: dict,
     temperature: float = 0.0,
     max_tokens: int = 256,
+    enable_detailed_timing: bool = False,
 ) -> tuple[str, float, dict]:
     """Run DFlash-accelerated inference for CoC generation only.
 
     Note: This only generates the CoC text, not the full trajectory.
     The trajectory generation would use the standard diffusion sampling.
+
+    Args:
+        enable_detailed_timing: If True, measure detailed timing breakdown
+            (draft, verify, sample, cache) using CUDA events. Default False for
+            maximum speed.
 
     Returns:
         Tuple of (coc_text, time_ms, stats_dict).
@@ -130,6 +136,7 @@ def run_dflash_inference(
             max_new_tokens=max_tokens,
             stop_token_ids=[stop_token_id],
             temperature=temperature,
+            enable_detailed_timing=enable_detailed_timing,
         )
 
     torch.cuda.synchronize()
@@ -581,7 +588,7 @@ def main():
     parser.add_argument(
         "--draft-model",
         type=str,
-        default="/models/Qwen3-8B-DFlash-b16",
+        default="/exp/dflash_train_0115_163242/best",
         help="Path to DFlash draft model (local path)",
     )
     parser.add_argument(
@@ -630,6 +637,11 @@ def main():
         type=str,
         default="/exp",
         help="Directory to save experiment results",
+    )
+    parser.add_argument(
+        "--detailed-timing",
+        action="store_true",
+        help="Enable detailed timing breakdown (draft/verify/sample/cache). Adds slight overhead.",
     )
     args = parser.parse_args()
 
@@ -832,7 +844,8 @@ def main():
             else:
                 coc_dflash, time_dflash, stats = run_dflash_inference(
                     model, accelerator, tokenized_data,
-                    temperature=args.temperature, max_tokens=args.max_tokens
+                    temperature=args.temperature, max_tokens=args.max_tokens,
+                    enable_detailed_timing=args.detailed_timing,
                 )
 
             dflash_times.append(time_dflash)
@@ -842,8 +855,8 @@ def main():
                 prefill_times.append(stats["prefill_time_ms"])
                 decode_times.append(stats["decode_time_ms"])
                 tokens_per_sec.append(stats.get("tokens_per_second", 0))
-            # Collect detailed timing
-            if "draft_time_ms" in stats:
+            # Collect detailed timing (only if enabled - values will be non-zero)
+            if stats.get("draft_time_ms", 0) > 0:
                 draft_times.append(stats["draft_time_ms"])
                 verify_times.append(stats["verify_time_ms"])
                 sample_times.append(stats["sample_time_ms"])
@@ -862,12 +875,13 @@ def main():
             if not args.verbose:
                 logger.info(f"  DFlash:   {time_dflash:.1f}ms (prefill={stats.get('prefill_time_ms', 0):.1f}ms, decode={stats.get('decode_time_ms', 0):.1f}ms)")
                 logger.info(f"            accept_rate={stats['acceptance_rate']:.1%}, accept_len={stats['mean_acceptance_length']:.2f}, tok/s={stats.get('tokens_per_second', 0):.1f}")
-                # Detailed decode breakdown
+                # Detailed decode breakdown (only show if detailed timing enabled)
                 draft_ms = stats.get('draft_time_ms', 0)
-                verify_ms = stats.get('verify_time_ms', 0)
-                sample_ms = stats.get('sample_time_ms', 0)
-                cache_ms = stats.get('cache_time_ms', 0)
-                logger.info(f"            decode breakdown: draft={draft_ms:.1f}ms, verify={verify_ms:.1f}ms, sample={sample_ms:.1f}ms, cache={cache_ms:.1f}ms")
+                if draft_ms > 0:
+                    verify_ms = stats.get('verify_time_ms', 0)
+                    sample_ms = stats.get('sample_time_ms', 0)
+                    cache_ms = stats.get('cache_time_ms', 0)
+                    logger.info(f"            decode breakdown: draft={draft_ms:.1f}ms, verify={verify_ms:.1f}ms, sample={sample_ms:.1f}ms, cache={cache_ms:.1f}ms")
 
             if args.compare:
                 # Compare VLM-only times (fair comparison - both doing CoC generation)
@@ -915,8 +929,8 @@ def main():
             logger.info(f"  Avg prefill time:      {avg_prefill:.1f} ms")
             logger.info(f"  Avg decode time:       {avg_decode:.1f} ms")
             logger.info(f"  Avg tokens/sec:        {avg_tps:.1f}")
-        # Detailed decode breakdown
-        if draft_times:
+        # Detailed decode breakdown (only show if detailed timing was enabled)
+        if draft_times and sum(draft_times) > 0:
             avg_draft = np.mean(draft_times)
             avg_verify = np.mean(verify_times)
             avg_sample = np.mean(sample_times)

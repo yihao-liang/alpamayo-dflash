@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NUM_CHUNKS="${1:-400}"
-OUTPUT_DIR="${2:-/data/dflash_distillation}"
+OUTPUT_DIR="${2:-/data/dflash_train}"
 TARGET_LAYERS="${3:-24,30,31,32,34}"
 STRIDE="${4:-1}"
 NUM_GPUS=8

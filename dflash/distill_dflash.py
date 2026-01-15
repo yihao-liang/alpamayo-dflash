@@ -17,14 +17,14 @@ Key optimization: Prefix-Weighted Cross-Entropy
 Usage (Single GPU):
     python train_dflash.py \
         --draft-model /models/Qwen3-8B-DFlash-b16 \
-        --data-dir /data/dflash_distillation \
+        --data-dir /data/dflash_train \
         --output-dir /exp/dflash_checkpoints \
         --loss-type ce+kl
 
 Usage (Multi-GPU with torchrun):
     torchrun --nproc_per_node=8 train_dflash.py \
         --draft-model /models/Qwen3-8B-DFlash-b16 \
-        --data-dir /data/dflash_distillation \
+        --data-dir /data/dflash_train \
         --output-dir /exp/dflash_checkpoints \
         --loss-type ce+kl
 """
@@ -771,7 +771,7 @@ def main():
                         help="Path to pre-trained DFlash model for initialization")
     parser.add_argument("--target-model", type=str, default="/models/Alpamayo-R1-10B",
                         help="Path to target model (for embedding layer only)")
-    parser.add_argument("--data-dir", type=str, default="/data/dflash_distillation",
+    parser.add_argument("--data-dir", type=str, default="/data/dflash_train",
                         help="Directory containing distillation data shards")
     parser.add_argument("--output-dir", type=str, default="/exp",
                         help="Base output directory (experiment folder with timestamp will be created)")

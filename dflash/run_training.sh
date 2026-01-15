@@ -18,7 +18,7 @@ GPUS_PER_NODE=8
 
 # Model paths
 TARGET_MODEL="/models/Alpamayo-R1-10B"
-DATA_DIR="/data/dflash_distillation"
+DATA_DIR="/data/dflash_train"
 OUTPUT_DIR="/exp"
 
 # Training hyperparameters
