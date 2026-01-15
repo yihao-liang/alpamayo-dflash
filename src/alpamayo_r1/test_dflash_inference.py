@@ -360,9 +360,37 @@ def run_dflash_inference_verbose(
         # Update cache
         past_key_values_target.crop(start_pos)
 
-        # Update target hidden
-        new_hidden = extract_context_feature(verify_output.hidden_states, target_layer_ids)
-        target_hidden = new_hidden[:, acceptance_length : acceptance_length + 1, :]
+        # Update target hidden - CRITICAL: use correction pass when rejection occurs
+        if acceptance_length == block_size - 1:
+            # Full match: hidden state from verify_output is correct
+            new_hidden = extract_context_feature(verify_output.hidden_states, target_layer_ids)
+            target_hidden = new_hidden[:, -1:, :]
+            log(f"  [Hidden: from verify_output, full match]")
+        else:
+            # Rejection: hidden state at acceptance_length is WRONG (computed under draft token)
+            # Must run correction pass on the actual accepted token
+            correction_token_id = output_ids[:, start_pos - 1 : start_pos]  # (B, 1)
+            correction_pos = start_pos - 1
+
+            if rope_deltas is not None:
+                corr_pos_tensor = torch.tensor([correction_pos], device=device, dtype=torch.long)
+                corr_position_ids = corr_pos_tensor.view(1, 1, 1).expand(3, 1, 1).clone()
+                corr_position_ids = corr_position_ids + rope_deltas.unsqueeze(-1).to(dtype=torch.long, device=device)
+            else:
+                corr_position_ids = torch.tensor([[correction_pos]], device=device, dtype=torch.long)
+
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                correction_output = accelerator.target_vlm(
+                    input_ids=correction_token_id,
+                    position_ids=corr_position_ids,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+
+            new_hidden = extract_context_feature(correction_output.hidden_states, target_layer_ids)
+            target_hidden = new_hidden[:, -1:, :]
+            log(f"  [Hidden: CORRECTION PASS for token '{model.tokenizer.decode([correction_token_id[0, 0].item()])}']")
 
         if step_num >= 50:  # Safety limit for verbose mode
             log(f"\n  >>> REACHED MAX STEPS (50)")

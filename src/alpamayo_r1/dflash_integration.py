@@ -665,14 +665,50 @@ class DFlashAlpamayoAccelerator:
             past_key_values_target.crop(start)
 
             # Extract hidden state for next iteration's context.
-            # hidden[acceptance_length] is at absolute position (old_start + acceptance_length),
-            # which equals (new_start - 1) - exactly what we need as context BEFORE the next block.
-            # Due to causal attention, this hidden state only depends on positions 0..acceptance_length
-            # (all correctly accepted tokens), unaffected by wrong tokens at later positions.
-            new_hidden = extract_context_feature(
-                verify_output.hidden_states, self.target_layer_ids
-            )
-            target_hidden = new_hidden[:, acceptance_length : acceptance_length + 1, :]
+            # CRITICAL: When a rejection occurs, the hidden state at position acceptance_length
+            # in verify_output was computed under the WRONG draft token, not the correction token.
+            # We must run a "correction pass" to get the true hidden state.
+
+            if acceptance_length == block_size - 1:
+                # Full match (all drafted tokens accepted): hidden state is correct
+                new_hidden = extract_context_feature(
+                    verify_output.hidden_states, self.target_layer_ids
+                )
+                target_hidden = new_hidden[:, -1:, :]
+            else:
+                # Rejection occurred: hidden state at acceptance_length is WRONG
+                # (computed under draft token, but we need hidden for correction token)
+                # Run correction pass on the actual accepted token
+
+                # The correction token is at position (start - 1) in output_ids
+                correction_token_id = output_ids[:, start - 1 : start]  # (B, 1)
+
+                # Prepare position IDs for the correction token
+                correction_pos = start - 1
+                if rope_deltas is not None:
+                    # MROPE: Create 3D position IDs
+                    corr_pos_tensor = torch.tensor([correction_pos], device=device, dtype=torch.long)
+                    corr_position_ids = corr_pos_tensor.view(1, 1, 1).expand(3, bsz, 1).clone()
+                    corr_position_ids = corr_position_ids + rope_deltas.unsqueeze(-1).to(
+                        dtype=torch.long, device=device
+                    )
+                else:
+                    corr_position_ids = torch.tensor([[correction_pos]], device=device, dtype=torch.long)
+
+                # Run correction pass to get true hidden state
+                correction_output = self.target_vlm(
+                    input_ids=correction_token_id,
+                    position_ids=corr_position_ids,
+                    past_key_values=past_key_values_target,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+
+                # Extract hidden state from correction pass
+                new_hidden = extract_context_feature(
+                    correction_output.hidden_states, self.target_layer_ids
+                )
+                target_hidden = new_hidden[:, -1:, :]
 
         stats.decode_time_ms = (time.perf_counter() - decode_start) * 1000
 
