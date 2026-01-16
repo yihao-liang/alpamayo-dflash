@@ -735,6 +735,7 @@ def main():
     standard_prefill_times = []
     standard_decode_times = []
     standard_tokens_per_sec = []
+    diffusion_times = []
     acceptance_rates = []
     acceptance_lengths = []
     speedups = []
@@ -795,6 +796,7 @@ def main():
                 standard_prefill_times.append(vlm_prefill_ms)
                 standard_decode_times.append(vlm_decode_ms)
                 standard_tokens_per_sec.append(tps)
+                diffusion_times.append(diffusion_ms)
 
                 # Compute minADE
                 gt_xy = data["ego_future_xyz"].cpu()[0, 0, :, :2].T.numpy()
@@ -873,7 +875,11 @@ def main():
             }
 
             if not args.verbose:
-                logger.info(f"  DFlash:   {time_dflash:.1f}ms (prefill={stats.get('prefill_time_ms', 0):.1f}ms, decode={stats.get('decode_time_ms', 0):.1f}ms)")
+                # Show diffusion time if available (same as standard since DFlash only accelerates VLM)
+                if args.compare:
+                    logger.info(f"  DFlash:   {time_dflash:.1f}ms (prefill={stats.get('prefill_time_ms', 0):.1f}ms, decode={stats.get('decode_time_ms', 0):.1f}ms) + {diffusion_ms:.1f}ms diffusion")
+                else:
+                    logger.info(f"  DFlash:   {time_dflash:.1f}ms (prefill={stats.get('prefill_time_ms', 0):.1f}ms, decode={stats.get('decode_time_ms', 0):.1f}ms)")
                 logger.info(f"            accept_rate={stats['acceptance_rate']:.1%}, accept_len={stats['mean_acceptance_length']:.2f}, tok/s={stats.get('tokens_per_second', 0):.1f}")
                 # Detailed decode breakdown (only show if detailed timing enabled)
                 draft_ms = stats.get('draft_time_ms', 0)
@@ -944,6 +950,10 @@ def main():
             logger.info(f"    - Other overhead:    {other_time:.1f} ms ({100*other_time/avg_decode:.1f}%)")
         logger.info(f"  Avg acceptance rate:   {avg_acceptance_rate:.1%}")
         logger.info(f"  Avg acceptance length: {avg_acceptance_length:.2f}")
+        # Show diffusion time if available (same for DFlash and Standard)
+        if diffusion_times:
+            avg_diffusion = np.mean(diffusion_times)
+            logger.info(f"  Avg diffusion time:    {avg_diffusion:.1f} ms (same as standard)")
 
         if args.compare and len(standard_times) > 0:
             avg_standard_time = np.mean(standard_times)  # Wall clock (VLM + diffusion)
@@ -960,6 +970,9 @@ def main():
             logger.info(f"  Avg VLM prefill:       {avg_standard_prefill:.1f} ms")
             logger.info(f"  Avg VLM decode:        {avg_standard_decode:.1f} ms")
             logger.info(f"  Avg tokens/sec:        {avg_standard_tps:.1f}")
+            if diffusion_times:
+                avg_diffusion = np.mean(diffusion_times)
+                logger.info(f"  Avg diffusion time:    {avg_diffusion:.1f} ms")
 
             logger.info(f"\nSpeedup (CoC generation only):")
             logger.info(f"  VLM total speedup:     {avg_speedup:.2f}x")
@@ -994,6 +1007,8 @@ def main():
         results["aggregate"]["avg_standard_tokens_per_sec"] = float(np.mean(standard_tokens_per_sec))
         results["aggregate"]["avg_speedup"] = float(np.mean(speedups))
         results["aggregate"]["avg_decode_speedup"] = float(np.mean(decode_speedups))
+        if diffusion_times:
+            results["aggregate"]["avg_diffusion_time_ms"] = float(np.mean(diffusion_times))
 
     # Save results
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')

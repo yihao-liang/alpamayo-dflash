@@ -22,7 +22,8 @@ Trying to speed up Alpamayo's Chain-of-Causation text generation using DFlash bl
 | **Total time** | 941.6 ms | 1569.5 ms | 1.69x |
 | **Prefill time** | 788.7 ms | 877.7 ms | - |
 | **Decode time** | 149.9 ms | 691.8 ms | **5.77x** |
-| **Tokens/sec** | 111.7 | 22.2 | 5.0x |
+| **Tokens/sec** | 111.7 | 22.2 | **5.0x** |
+| **Diffusion  Time** | 517.4 | 517.4 | - |
 
 | Speculative Decoding Metrics | Value |
 |------------------------------|-------|
