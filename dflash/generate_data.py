@@ -37,9 +37,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# DFlash configuration
-BLOCK_SIZE = 8  # Smaller blocks for short CoC sequences (avg 14 tokens)
-
 # Standard Qwen3 vocabulary size (before Alpamayo's extensions)
 # Tokens >= this value are trajectory tokens and should be masked in training
 STANDARD_VOCAB_SIZE = 151936
@@ -204,7 +201,7 @@ def create_training_blocks(
     input_ids: torch.Tensor,
     logits: torch.Tensor,
     generation_start_idx: int,
-    block_size: int = BLOCK_SIZE,
+    block_size: int,
     stride: int = 1,
     top_k_logits: int = 128,
     mask_extended_vocab: bool = True,
@@ -231,31 +228,45 @@ def create_training_blocks(
         block_topk_indices: (num_blocks, block_size-1, top_k) - top-k logit indices
     """
     seq_len = hidden_states.shape[0]
+    gen_len = seq_len - generation_start_idx
 
-    # We want to predict tokens after generation_start_idx
-    # Start from positions that have block_size tokens ahead
-    start_pos = max(0, generation_start_idx - block_size)  # Include some context before generation
-    end_pos = seq_len - block_size
-
-    if end_pos <= start_pos:
+    if gen_len < 1:
+        # No generated tokens at all
         return None, None, None, None, None
 
+    # Start at generation boundary: future_tokens[0] = first generated token
+    # This ensures we only train on generated tokens, not prompt tokens
+    # At pos = generation_start_idx - 1:
+    #   - hidden_states[pos] = context from last prompt position
+    #   - future_tokens = input_ids[pos+1 : pos+1+block_size] = all generated tokens
+    start_pos = generation_start_idx - 1
+    end_pos = seq_len - block_size
+
+    # Pad if sequence too short to create any blocks
+    if end_pos <= start_pos:
+        # Need at least block_size generated tokens
+        pad_len = block_size - gen_len + 1
+        # Repeat last hidden state for padding
+        hidden_states = torch.cat([
+            hidden_states,
+            hidden_states[-1:].expand(pad_len, -1)
+        ], dim=0)
+        # Pad input_ids with last token (likely <|cot_end|>)
+        pad_token = input_ids[-1].item()
+        input_ids = torch.cat([
+            input_ids,
+            torch.full((pad_len,), pad_token, dtype=input_ids.dtype)
+        ], dim=0)
+        # Pad logits by repeating last
+        logits = torch.cat([
+            logits,
+            logits[-1:].expand(pad_len, -1)
+        ], dim=0)
+        # Update seq_len and end_pos
+        seq_len = hidden_states.shape[0]
+        end_pos = seq_len - block_size
+
     positions = list(range(start_pos, end_pos, stride))
-
-    # When stride > 1, ensure critical positions are included:
-    if stride > 1:
-        # 1. Prompt/generation boundary position (where inference starts)
-        boundary_pos = generation_start_idx - 1
-        if boundary_pos >= 0 and boundary_pos not in positions and boundary_pos < end_pos:
-            positions.append(boundary_pos)
-
-        # 2. End-of-CoC position (to capture <|cot_end|> token)
-        # This is the last position that has block_size tokens ahead
-        end_coc_pos = seq_len - block_size - 1
-        if end_coc_pos >= 0 and end_coc_pos not in positions and end_coc_pos < end_pos:
-            positions.append(end_coc_pos)
-
-        positions.sort()
 
     block_hidden = []
     block_tokens = []
@@ -363,6 +374,12 @@ def main():
         action="store_true",
         help="Train on full vocabulary including trajectory tokens (don't mask extended vocab)",
     )
+    parser.add_argument(
+        "--block-sizes",
+        type=str,
+        default="8,16",
+        help="Comma-separated block sizes to generate (e.g., '8,16')",
+    )
     args = parser.parse_args()
 
     # Parse target layers
@@ -418,21 +435,39 @@ def main():
     clip_index = pd.read_parquet(index_path)
     clip_ids = clip_index[clip_index["chunk"].isin(chunk_range)].index.tolist()
 
+    # Parse block sizes
+    block_sizes = [int(x.strip()) for x in args.block_sizes.split(",")]
+
     logger.info(f"[Rank {args.rank}] Processing {len(clip_ids)} clips from chunks {list(chunk_range)}")
-    logger.info(f"[Rank {args.rank}] Block size: {BLOCK_SIZE}, Stride: {args.stride}")
+    logger.info(f"[Rank {args.rank}] Block sizes: {block_sizes}, Stride: {args.stride}")
     logger.info(f"[Rank {args.rank}] Target layers: {target_layer_ids}")
     logger.info(f"[Rank {args.rank}] Top-K logits: {args.top_k_logits}")
     logger.info(f"[Rank {args.rank}] Full vocab (no masking): {args.full_vocab}")
 
-    # Process clips and accumulate blocks
-    all_hidden = []
-    all_tokens = []
-    all_labels = []
-    all_topk_values = []
-    all_topk_indices = []
-    total_blocks = 0
-    masked_tokens_count = 0
-    shard_idx = 0
+    # Create output directories and accumulators for each block size
+    # Each block size gets its own directory: {output_dir}_b{block_size}
+    output_dirs = {}
+    accumulators = {}
+    for bs in block_sizes:
+        if len(block_sizes) > 1:
+            # Multiple block sizes: separate directories with _b{size} suffix
+            out_dir = Path(str(output_dir) + f"_b{bs}")
+        else:
+            out_dir = output_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        output_dirs[bs] = out_dir
+        accumulators[bs] = {
+            "all_hidden": [],
+            "all_tokens": [],
+            "all_labels": [],
+            "all_topk_values": [],
+            "all_topk_indices": [],
+            "total_blocks": 0,
+            "masked_tokens_count": 0,
+            "shard_idx": 0,
+        }
+        logger.info(f"[Rank {args.rank}] Block size {bs} → {out_dir}")
+
     failed_clips = []
 
     pbar = tqdm(clip_ids, desc=f"[Rank {args.rank}] Processing clips")
@@ -446,80 +481,96 @@ def main():
                 maybe_stream=False,
             )
 
-            # Extract hidden states, tokens, and logits
+            # Extract hidden states, tokens, and logits (ONCE per clip)
             hidden_states, input_ids, gen_start, logits = extract_hidden_states_and_tokens(
                 model, processor, data, target_layer_ids, device=device
             )
 
-            # Create training blocks with top-k logits
-            # Pass keep_token_ids so <|cot_end|> is not masked
-            block_hidden, block_tokens, block_labels, block_topk_vals, block_topk_inds = create_training_blocks(
-                hidden_states.cpu(),
-                input_ids.cpu(),
-                logits.cpu(),
-                gen_start,
-                block_size=BLOCK_SIZE,
-                stride=args.stride,
-                top_k_logits=args.top_k_logits,
-                mask_extended_vocab=not args.full_vocab,
-                keep_token_ids=keep_token_ids,
-            )
+            # Create training blocks for EACH block size (reuse inference results)
+            for bs in block_sizes:
+                acc = accumulators[bs]
+                block_hidden, block_tokens, block_labels, block_topk_vals, block_topk_inds = create_training_blocks(
+                    hidden_states.cpu(),
+                    input_ids.cpu(),
+                    logits.cpu(),
+                    gen_start,
+                    block_size=bs,
+                    stride=args.stride,
+                    top_k_logits=args.top_k_logits,
+                    mask_extended_vocab=not args.full_vocab,
+                    keep_token_ids=keep_token_ids,
+                )
 
-            if block_hidden is not None:
-                all_hidden.append(block_hidden.half())  # Convert to fp16
-                all_tokens.append(block_tokens.int())
-                all_labels.append(block_labels.int())
-                all_topk_values.append(block_topk_vals.half())  # fp16
-                all_topk_indices.append(block_topk_inds.int())  # int32
-                total_blocks += block_hidden.shape[0]
-                # Count masked tokens (extended vocab)
-                masked_tokens_count += (block_labels == IGNORE_INDEX).sum().item()
+                if block_hidden is not None:
+                    acc["all_hidden"].append(block_hidden.half())
+                    acc["all_tokens"].append(block_tokens.int())
+                    acc["all_labels"].append(block_labels.int())
+                    acc["all_topk_values"].append(block_topk_vals.half())
+                    acc["all_topk_indices"].append(block_topk_inds.int())
+                    acc["total_blocks"] += block_hidden.shape[0]
+                    acc["masked_tokens_count"] += (block_labels == IGNORE_INDEX).sum().item()
 
-            pbar.set_postfix({"blocks": total_blocks, "shards": shard_idx})
+                # Save shard when enough blocks accumulated
+                if acc["total_blocks"] >= args.shard_size * (acc["shard_idx"] + 1):
+                    save_shard(
+                        acc["all_hidden"], acc["all_tokens"], acc["all_labels"],
+                        acc["all_topk_values"], acc["all_topk_indices"],
+                        output_dirs[bs], acc["shard_idx"], args, rank_suffix
+                    )
+                    acc["all_hidden"] = []
+                    acc["all_tokens"] = []
+                    acc["all_labels"] = []
+                    acc["all_topk_values"] = []
+                    acc["all_topk_indices"] = []
+                    acc["shard_idx"] += 1
 
-            # Save shard when enough blocks accumulated
-            if total_blocks >= args.shard_size * (shard_idx + 1):
-                save_shard(all_hidden, all_tokens, all_labels, all_topk_values, all_topk_indices, output_dir, shard_idx, args, rank_suffix)
-                all_hidden = []
-                all_labels = []
-                all_tokens = []
-                all_topk_values = []
-                all_topk_indices = []
-                shard_idx += 1
+            # Update progress bar with total blocks across all configs
+            total = sum(acc["total_blocks"] for acc in accumulators.values())
+            pbar.set_postfix({"blocks": total, "configs": len(block_sizes)})
 
         except Exception as e:
             failed_clips.append({"clip_id": clip_id, "error": str(e)})
             logger.warning(f"[Rank {args.rank}] Failed to process {clip_id}: {e}")
 
-    # Save remaining blocks
-    if all_hidden:
-        save_shard(all_hidden, all_tokens, all_labels, all_topk_values, all_topk_indices, output_dir, shard_idx, args, rank_suffix)
-        shard_idx += 1
+    # Save remaining blocks and metadata for each block size
+    for bs in block_sizes:
+        acc = accumulators[bs]
+        out_dir = output_dirs[bs]
 
-    # Save metadata
-    total_tokens = total_blocks * BLOCK_SIZE
-    metadata = {
-        "rank": args.rank,
-        "chunk_range": list(chunk_range),
-        "num_shards": shard_idx,
-        "total_blocks": total_blocks,
-        "block_size": BLOCK_SIZE,
-        "stride": args.stride,
-        "target_layer_ids": target_layer_ids,
-        "num_target_layers": NUM_TARGET_LAYERS,
-        "num_draft_layers": NUM_DRAFT_LAYERS,
-        "top_k_logits": args.top_k_logits,
-        "full_vocab": args.full_vocab,
-        "num_clips": len(clip_ids),
-        "failed_clips": len(failed_clips),
-        "standard_vocab_size": STANDARD_VOCAB_SIZE,
-        "masked_tokens": masked_tokens_count,
-        "masked_token_ratio": masked_tokens_count / total_tokens if total_tokens > 0 else 0,
-    }
+        if acc["all_hidden"]:
+            save_shard(
+                acc["all_hidden"], acc["all_tokens"], acc["all_labels"],
+                acc["all_topk_values"], acc["all_topk_indices"],
+                out_dir, acc["shard_idx"], args, rank_suffix
+            )
+            acc["shard_idx"] += 1
 
-    metadata_filename = f"metadata{rank_suffix}.json"
-    with open(output_dir / metadata_filename, "w") as f:
-        json.dump(metadata, f, indent=2)
+        # Save metadata
+        total_tokens = acc["total_blocks"] * bs
+        metadata = {
+            "rank": args.rank,
+            "chunk_range": list(chunk_range),
+            "num_shards": acc["shard_idx"],
+            "total_blocks": acc["total_blocks"],
+            "block_size": bs,
+            "stride": args.stride,
+            "target_layer_ids": target_layer_ids,
+            "num_target_layers": NUM_TARGET_LAYERS,
+            "num_draft_layers": NUM_DRAFT_LAYERS,
+            "top_k_logits": args.top_k_logits,
+            "full_vocab": args.full_vocab,
+            "num_clips": len(clip_ids),
+            "failed_clips": len(failed_clips),
+            "standard_vocab_size": STANDARD_VOCAB_SIZE,
+            "masked_tokens": acc["masked_tokens_count"],
+            "masked_token_ratio": acc["masked_tokens_count"] / total_tokens if total_tokens > 0 else 0,
+        }
+
+        metadata_filename = f"metadata{rank_suffix}.json"
+        with open(out_dir / metadata_filename, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"[Rank {args.rank}] Block size {bs}: {acc['total_blocks']:,} blocks, {acc['shard_idx']} shards → {out_dir}")
 
     if failed_clips:
         failed_filename = f"failed_clips{rank_suffix}.json"
@@ -529,11 +580,9 @@ def main():
     logger.info("=" * 60)
     logger.info(f"[Rank {args.rank}] Generation complete!")
     logger.info(f"  Chunks: {list(chunk_range)}")
-    logger.info(f"  Total blocks: {total_blocks:,}")
-    logger.info(f"  Shards: {shard_idx}")
+    for bs in block_sizes:
+        logger.info(f"  Block size {bs}: {accumulators[bs]['total_blocks']:,} blocks")
     logger.info(f"  Failed clips: {len(failed_clips)}")
-    if total_tokens > 0:
-        logger.info(f"  Masked tokens: {masked_tokens_count:,} ({100*masked_tokens_count/total_tokens:.2f}%)")
     logger.info(f"  Output: {output_dir}")
 
 
